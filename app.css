@@ -60,5 +60,10 @@ table.data td input { width: 100%; min-width: 120px; font: inherit; padding: 3px
 .sheet-opt { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-top: 10px; display: grid; gap: 6px; }
 .warn { color: var(--warn); font-size: 13px; }
 .sheet-opt label { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.plan-box { display: grid; gap: 8px; padding: 10px; border-radius: 8px; background: var(--soft); }
+.sheet-opt label.opt { display: flex; gap: 8px; align-items: flex-start; flex-wrap: nowrap; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); cursor: pointer; }
+.opt input { margin-top: 4px; }
+.sheet-opt label.danger-opt { border: 2px solid #d32f2f; color: #c62828; background: #fdecec; }
+@media (prefers-color-scheme: dark) { .sheet-opt label.danger-opt { background: #3a1c1c; color: #ff8a80; border-color: #ff8a80; } }
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 10px 18px; border-radius: 8px; z-index: 10; max-width: calc(100vw - 32px); }
 @media (max-width: 600px) { .toolbar h2 { flex-basis: 100%; } .table-wrap { max-height: none; } }

@@ -122,79 +122,145 @@ function sheetToTable(ws) {
 const lostHebrew = (t) => [...t.columns.map((c) => c.label), ...t.rows.slice(0, 50).flatMap((r) => Object.values(r))]
   .some((v) => typeof v === "string" && /\?{2,}/.test(v));
 
-let upload = null; // { file, wb, tables: {sheetName: {columns, rows}} }
+let upload = null; // { file, tables: {sheetName: {columns, rows, skipped}} }
+const dmy = (iso) => iso ? iso.slice(0, 10).split("-").reverse().join("/") : "";
+const day = (v) => (typeof v === "string" && /^\d{4}-\d\d-\d\d/.test(v) ? v.slice(0, 10) : null);
+function dateRange(values) {
+  const ds = values.map(day).filter(Boolean).sort();
+  return ds.length ? { from: ds[0], to: ds[ds.length - 1] } : null;
+}
+// file columns -> table columns, matched by header text; new headers become new columns
+function mapToTable(ds, t) {
+  const cols = ds.columns.map((c) => ({ ...c }));
+  const map = {};
+  for (const c of t.columns) {
+    let hit = cols.find((x) => x.label === c.label);
+    if (!hit) { hit = { key: nextKey(cols), label: c.label, type: c.type }; cols.push(hit); }
+    map[c.key] = hit.key;
+  }
+  const rows = t.rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [map[k], v])));
+  const fileDate = t.columns.find((c) => c.type === "date");
+  return { cols, rows, dateKey: fileDate ? map[fileDate.key] : null };
+}
+// the existing table that most likely receives this sheet: same name, or the same column headers
+function guessTarget(name, t) {
+  const byName = state.datasets.find((d) => d.name === name);
+  if (byName) return byName;
+  const labels = t.columns.map((c) => c.label);
+  return labels.length ? state.datasets.find((d) => labels.every((l) => d.columns.some((c) => c.label === l))) : null;
+}
+
 $("upload-file").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   $("upload-sheets").innerHTML = ""; $("upload-go").disabled = true; $("upload-progress").textContent = "";
   if (!file) return;
   try {
     const wb = await readWorkbook(file);
-    upload ={ file, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
+    upload = { file, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
   } catch (err) { console.error(err); toast("לא הצלחתי לקרוא את הקובץ"); return; }
   const opts = state.datasets.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
-  $("upload-sheets").innerHTML = Object.entries(upload.tables).map(([name, t], i) => {
-    const existing = state.datasets.find((d) => d.name === name);
+  $("upload-sheets").innerHTML = Object.entries(upload.tables).map(([name, t]) => {
+    const dc = t.columns.find((c) => c.type === "date");
+    const r = dc && dateRange(t.rows.map((x) => x[dc.key]));
     return `<div class="sheet-opt" data-sheet="${esc(name)}">
       <label><input type="checkbox" class="s-on" ${t.rows.length ? "checked" : ""}> <b>${esc(name)}</b> <span class="muted">${t.rows.length} שורות · ${t.columns.length} עמודות</span></label>
+      ${r ? `<div>📅 תאריכים בקובץ: <b>${dmy(r.from)} – ${dmy(r.to)}</b> <span class="muted">(לפי העמודה "${esc(dc.label)}")</span></div>` : ""}
       ${t.columns.length ? `<div class="muted">עמודות: ${t.columns.map((c) => esc(c.label)).join(" · ")}</div>` : ""}
       ${t.skipped.length ? `<details class="muted"><summary>${t.skipped.length} שורות כותרת מעל הטבלה הושמטו</summary>${t.skipped.map((s) => `<div>${esc(s)}</div>`).join("")}</details>` : ""}
       ${lostHebrew(t) ? `<div class="warn">⚠ בקובץ מופיעים סימני שאלה במקום עברית. העברית כבר אבדה בקובץ עצמו (כנראה נשמר מחדש בתוכנה אחרת). כדאי להוריד אותו שוב מהבנק ולהעלות כמו שהוא, בלי לפתוח ולשמור.</div>` : ""}
       <label>לאן: <select class="s-target"><option value="new">טבלה חדשה</option>${opts}</select>
         <input type="text" class="s-name" value="${esc(name)}" placeholder="שם הטבלה"></label>
-      <label class="s-mode-wrap" hidden>אופן: <select class="s-mode"><option value="replace">החלפת כל השורות בטבלה</option><option value="append">הוספה לסוף הטבלה</option></select></label>
+      <div class="s-plan"></div>
     </div>`;
   }).join("");
-  document.querySelectorAll(".sheet-opt").forEach((el) => {
-    const existing = state.datasets.find((d) => d.name === el.dataset.sheet);
-    const sync = () => { const isNew = el.querySelector(".s-target").value === "new"; el.querySelector(".s-name").hidden = !isNew; el.querySelector(".s-mode-wrap").hidden = isNew; };
-    if (existing) el.querySelector(".s-target").value = existing.id;
+  document.querySelectorAll(".sheet-opt").forEach((el, i) => {
+    const t = upload.tables[el.dataset.sheet];
+    const guess = guessTarget(el.dataset.sheet, t);
+    if (guess) el.querySelector(".s-target").value = guess.id;
+    const sync = () => planSheet(el, i, t);
     el.querySelector(".s-target").addEventListener("change", sync); sync();
   });
   $("upload-go").disabled = false;
 });
 
+// Loading into a table that already has rows: compare date ranges and make the user choose what happens.
+async function planSheet(el, i, t) {
+  const target = el.querySelector(".s-target").value;
+  const box = el.querySelector(".s-plan");
+  el.querySelector(".s-name").hidden = target !== "new";
+  el.plan = null;
+  if (target === "new") { box.innerHTML = ""; el.plan = { mode: "new" }; return; }
+  const ds = state.datasets.find((d) => d.id === +target);
+  const m = mapToTable(ds, t);
+  box.innerHTML = `<span class="muted">בודק את הטבלה הקיימת…</span>`;
+  let existing;
+  try { existing = await fetchAll(() => sb.from("dataset_rows").select(m.dateKey ? `id,d:data->>${m.dateKey}` : "id").eq("dataset_id", ds.id).order("id")); }
+  catch (err) { console.error(err); box.innerHTML = `<span class="warn">לא הצלחתי לבדוק את הטבלה הקיימת</span>`; return; }
+  if (el.querySelector(".s-target").value !== target) return; // changed while loading
+  const plan = { mode: null, ds, m, total: existing.length };
+  el.plan = plan;
+  if (!existing.length) { plan.mode = "append"; box.innerHTML = `<div class="muted">הטבלה "${esc(ds.name)}" ריקה, השורות ייטענו אליה.</div>`; return; }
+
+  const fileR = m.dateKey && dateRange(m.rows.map((r) => r[m.dateKey]));
+  const tableR = m.dateKey && dateRange(existing.map((r) => r.d));
+  let info, periodOpt = "";
+  if (fileR && tableR) {
+    plan.range = fileR;
+    plan.overlap = existing.filter((r) => { const d = day(r.d); return d && d >= fileR.from && d <= fileR.to; }).length;
+    info = `בטבלה "${esc(ds.name)}" יש כבר <b>${existing.length}</b> שורות, מ-<b>${dmy(tableR.from)}</b> עד <b>${dmy(tableR.to)}</b>.<br>
+      הקובץ: <b>${dmy(fileR.from)} – ${dmy(fileR.to)}</b>, ${m.rows.length} שורות.<br>
+      ${plan.overlap ? `<b class="warn">${plan.overlap} שורות בטבלה נמצאות בתוך טווח התאריכים של הקובץ.</b>` : "אין חפיפה בתאריכים בין הקובץ לטבלה."}`;
+    if (plan.overlap) periodOpt = `<label class="opt"><input type="radio" name="mode${i}" value="period">
+      <span><b>החלפת התקופה ${dmy(fileR.from)} – ${dmy(fileR.to)}</b> (מומלץ): ${plan.overlap} השורות האלה יוחלפו בשורות מהקובץ, והשורות מחוץ לתקופה יישארו. שימו לב: גם שורות שנוספו באתר בתקופה הזאת יוחלפו.</span></label>`;
+  } else {
+    info = `בטבלה "${esc(ds.name)}" יש כבר <b>${existing.length}</b> שורות${m.dateKey ? "" : " (אין עמודת תאריך להשוואה)"}.`;
+  }
+  box.innerHTML = `<div class="plan-box"><div>${info}</div><div class="muted">מה לעשות? (חובה לבחור)</div>
+    ${periodOpt}
+    <label class="opt"><input type="radio" name="mode${i}" value="append">
+      <span><b>הוספה בלבד</b>: כל ${m.rows.length} שורות הקובץ יתווספו, בלי למחוק כלום${plan.overlap ? `. <span class="warn">שורות בתקופה החופפת יופיעו פעמיים.</span>` : "."}</span></label>
+    <label class="opt danger-opt"><input type="radio" name="mode${i}" value="all">
+      <span><b>⚠ דריסת כל הטבלה</b>: מחיקת כל ${existing.length} השורות הקיימות (כולל מה שנוסף באתר) והשארת תוכן הקובץ בלבד. אין דרך חזרה.</span></label>
+  </div>`;
+  box.querySelectorAll("input[type=radio]").forEach((r) => r.addEventListener("change", () => { plan.mode = r.value; }));
+}
+
 $("upload-go").addEventListener("click", async () => {
   const jobs = [...document.querySelectorAll(".sheet-opt")].filter((el) => el.querySelector(".s-on").checked);
   if (!jobs.length) return toast("לא נבחר אף גיליון");
   for (const el of jobs) {
-    const target = el.querySelector(".s-target").value;
-    if (target !== "new" && el.querySelector(".s-mode").value === "replace") {
-      const ds = state.datasets.find((d) => d.id === +target);
-      if (!confirm(`להחליף את כל ${state.counts[ds.id] ?? ""} השורות בטבלה "${ds.name}" בתוכן הגיליון? שורות שנוספו באתר יימחקו.`)) return;
-    }
+    if (!el.plan) return toast("רגע, עדיין בודק את הטבלה הקיימת");
+    if (!el.plan.mode) { el.scrollIntoView({ block: "center" }); return toast(`צריך לבחור מה לעשות עם הנתונים הקיימים בטבלה "${el.plan.ds.name}"`, 4000); }
+    if (el.plan.mode === "all" && !confirm(`⚠ למחוק את כל ${el.plan.total} השורות בטבלה "${el.plan.ds.name}" ולהשאיר רק את תוכן הקובץ? אין דרך חזרה.`)) return;
   }
   $("upload-go").disabled = true;
   let lastId = null;
   try {
     for (const el of jobs) {
       const t = upload.tables[el.dataset.sheet];
-      const target = el.querySelector(".s-target").value;
-      if (target === "new") {
+      const plan = el.plan;
+      if (plan.mode === "new") {
         const name = el.querySelector(".s-name").value.trim() || el.dataset.sheet;
         const { data, error } = await sb.from("datasets").insert({ name, columns: t.columns, source_file: upload.file.name }).select().single();
         if (error) throw error.code === "23505" ? new Error(`כבר קיימת טבלה בשם "${name}"`) : error;
         await insertRows(data.id, t.rows, "excel");
         lastId = data.id;
-      } else {
-        const ds = state.datasets.find((d) => d.id === +target);
-        // match the sheet's columns to the table's columns by header text; new headers become new columns
-        const cols = ds.columns.map((c) => ({ ...c }));
-        const map = {};
-        for (const c of t.columns) {
-          let hit = cols.find((x) => x.label === c.label);
-          if (!hit) { hit = { key: nextKey(cols), label: c.label, type: c.type }; cols.push(hit); }
-          map[c.key] = hit.key;
-        }
-        const rows = t.rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [map[k], v])));
-        if (el.querySelector(".s-mode").value === "replace") {
-          const { error } = await sb.from("dataset_rows").delete().eq("dataset_id", ds.id);
-          if (error) throw error;
-        }
-        const { error } = await sb.from("datasets").update({ columns: cols, source_file: upload.file.name }).eq("id", ds.id);
-        if (error) throw error;
-        await insertRows(ds.id, rows, "excel");
-        lastId = ds.id;
+        continue;
       }
+      const { ds, m } = plan;
+      if (plan.mode === "all") {
+        const { error } = await sb.from("dataset_rows").delete().eq("dataset_id", ds.id);
+        if (error) throw error;
+      } else if (plan.mode === "period") {
+        $("upload-progress").textContent = `מוחק את השורות הקיימות בתקופה ${dmy(plan.range.from)} – ${dmy(plan.range.to)}…`;
+        const { error } = await sb.from("dataset_rows").delete().eq("dataset_id", ds.id)
+          .gte(`data->>${m.dateKey}`, plan.range.from).lt(`data->>${m.dateKey}`, plan.range.to + "~"); // "~" sorts after any time part
+        if (error) throw error;
+      }
+      const { error } = await sb.from("datasets").update({ columns: m.cols, source_file: upload.file.name }).eq("id", ds.id);
+      if (error) throw error;
+      await insertRows(ds.id, m.rows, "excel");
+      lastId = ds.id;
     }
     sb.from("usage_logs").insert({ visitor_name: user.email, action: `upload:${upload.file.name}` }).then(() => {});
     $("upload-dlg").close();
