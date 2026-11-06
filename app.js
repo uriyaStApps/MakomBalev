@@ -11,8 +11,37 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
 const TOPICS = [
   { id: "cashflow", label: "טעינת cash flow", table: "Cash Flow", derive: deriveCashFlow },
   { id: "outflow", label: "טעינת cash flow outflow uptoday", table: "Cash Flow Outflow Uptoday", derive: deriveCashFlow },
-  { id: "categories", label: "טעינת קטגוריות", table: "Categories" },
 ];
+// The Categories table is not uploaded: the site creates it once with this list, then it's edited on the site
+// (add a row, ⬇ Excel to download). "type" is a dropdown.
+const CATEGORIES_TABLE = "Categories";
+const CATEGORY_TYPES = ["Inflows", "Outflows"];
+const DEFAULT_CATEGORIES = [
+  ["Partisipans Paymant", "Inflows"], ["Bituach Leumi", "Inflows"], ["Donations", "Inflows"], ["Other", "Inflows"],
+  ["Wages", "Outflows"], ["Tax", "Outflows"], ["Butuach Leumi", "Outflows"], ["Pensia", "Outflows"], ["Food YadHashmona", "Outflows"],
+  ["Food BV", "Outflows"], ["Rent Kfar Habaptistim", "Outflows"], ["Expense that Workers Pay", "Outflows"], ["Utility", "Outflows"],
+  ["Office", "Outflows"], ["Administration", "Outflows"], ["Insurance", "Outflows"], ["Vehilcles Repair", "Outflows"], ["Gas", "Outflows"],
+  ["Bank", "Outflows"], ["bookkeeping", "Outflows"], ["Development and Marketing Webside", "Outflows"], ["Lawer", "Outflows"],
+  ["Media", "Outflows"], ["Project Yuval", "Outflows"], ["Kredit Card Visa", "Outflows"], ["Kredit Card Mastercard", "Outflows"],
+];
+async function ensureCategories() {
+  const existing = state.datasets.find((d) => d.name === CATEGORIES_TABLE);
+  if (existing) { // loaded earlier from a file: just make "type" a dropdown
+    const typeCol = existing.columns.find((c) => /^\s*type\s*$/i.test(c.label));
+    if (typeCol && !typeCol.options) {
+      const columns = existing.columns.map((c) => (c === typeCol ? { ...c, options: CATEGORY_TYPES } : c));
+      const { error } = await sb.from("datasets").update({ columns }).eq("id", existing.id);
+      if (!error) existing.columns = columns;
+    }
+    return;
+  }
+  const columns = [{ key: "c1", label: "category", type: "text" }, { key: "c2", label: "type", type: "text", options: CATEGORY_TYPES }];
+  const { data, error } = await sb.from("datasets").insert({ name: CATEGORIES_TABLE, columns, source_file: null }).select().single();
+  if (error) { if (error.code !== "23505") console.error(error); return; } // 23505: another user just created it
+  const { error: e2 } = await sb.from("dataset_rows").insert(DEFAULT_CATEGORIES.map(([c, t]) => ({ dataset_id: data.id, data: { c1: c, c2: t }, origin: "site" })));
+  if (e2) console.error(e2);
+  await loadDatasets();
+}
 // Cash Flow's "Category" is chosen by hand from the Categories table (manual = kept when the period is reloaded)
 const CATEGORY_COL = { label: "Category", type: "text", lookup: "Categories", manual: true };
 
@@ -67,6 +96,25 @@ function deriveCashFlow(t) {
   return n;
 }
 const topicOf = (ds) => ds && TOPICS.find((tp) => tp.table === ds.name);
+
+// ---------------- which file belongs where (blocks loading a file into the wrong subject) ----------------
+const hasCol = (t, re, type) => t.columns.some((c) => re.test(c.label) && (!type || c.type === type));
+const isBank = (t) => hasCol(t, /תאריך|date/i) && hasCol(t, /חובה|debit/i) && hasCol(t, /זכות|credit/i) && hasCol(t, /יתרה|balance/i);
+const FILE_RULES = {
+  cashflow: { test: isBank, need: "תאריך, בחובה, בזכות, יתרה בש\"ח (קובץ תנועות עו\"ש מהבנק)" },
+  outflow: {
+    test: (t) => !isBank(t) && (hasCol(t, /month|חודש/i) || t.columns.some((c) => c.type === "date")) && hasCol(t, /amount|סכום|חובה|זכות|outflow|הוצא/i),
+    need: "חודש או תאריך, וסכום (למשל category / month / type / amountNIS)",
+  },
+};
+const fitsOf = (t) => TOPICS.filter((tp) => FILE_RULES[tp.id]?.test(t)).map((tp) => tp.id); // run on the file as read, before derive
+// null = OK, otherwise why this file can't go into that subject's table
+function wrongPlace(t, topic) {
+  if (!topic || !FILE_RULES[topic.id] || t.fits.includes(topic.id)) return null;
+  const other = TOPICS.find((tp) => t.fits.includes(tp.id));
+  if (other) return `הקובץ הזה נראה כמו קובץ של <b>${esc(other.table)}</b>, לא של ${esc(topic.table)}. השתמשו בכפתור "${esc(other.label)}".`;
+  return `הקובץ לא מתאים ל-<b>${esc(topic.table)}</b>. צריך עמודות: ${esc(FILE_RULES[topic.id].need)}.<br>בקובץ יש: ${t.columns.map((c) => esc(c.label)).join(" · ") || "(אין עמודות)"}`;
+}
 const SHOW = 200;     // rows rendered at a time
 const CHUNK = 500;    // rows per insert request
 const state = { tab: "tables", datasets: [], counts: {}, ds: null, rows: [], q: "", sort: null, shown: SHOW, users: [], editing: null };
@@ -258,7 +306,8 @@ $("upload-file").addEventListener("change", async (e) => {
     const wb = await readWorkbook(file);
     upload = { file, topic: uploadTopic, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
   } catch (err) { console.error(err); toast("לא הצלחתי לקרוא את הקובץ"); return; }
-  if (upload.topic?.derive) Object.values(upload.tables).forEach((t) => upload.topic.derive(t));
+  Object.values(upload.tables).forEach((t) => { t.fits = fitsOf(t); });
+  if (upload.topic?.derive) Object.values(upload.tables).forEach((t) => { if (t.fits.includes(upload.topic.id)) upload.topic.derive(t); });
   const opts = state.datasets.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
   $("upload-sheets").innerHTML = Object.entries(upload.tables).map(([name, t]) => {
     const dc = t.columns.find((c) => c.type === "date");
@@ -275,12 +324,16 @@ $("upload-file").addEventListener("change", async (e) => {
     </div>`;
   }).join("");
   const topic = upload.topic;
-  let first = true;
+  // subject upload: pick the first sheet that fits the subject (a whole workbook may hold many sheets), else the first non-empty one
+  const sheetNames = Object.keys(upload.tables);
+  const squash = (s) => String(s).toLowerCase().replace(/[^a-z0-9֐-׿]/g, "");
+  const fits = (n) => upload.tables[n].rows.length && upload.tables[n].fits.includes(topic.id);
+  const named = (n) => squash(n).includes(squash(topic.table).slice(0, 6)); // "category" sheet for "Categories", "cashFlow" for the outflow table
+  const pick = topic && (sheetNames.find((n) => fits(n) && named(n)) || sheetNames.find(fits) || sheetNames.find((n) => upload.tables[n].rows.length));
   document.querySelectorAll(".sheet-opt").forEach((el, i) => {
     const t = upload.tables[el.dataset.sheet];
     if (topic) {
-      // subject upload: the (first non-empty) sheet goes into the subject's table, created on the first load
-      const on = first && t.rows.length > 0; if (on) first = false;
+      const on = el.dataset.sheet === pick;
       el.querySelector(".s-on").checked = on;
       const guess = state.datasets.find((d) => d.name === topic.table) || guessTarget(el.dataset.sheet, t);
       el.querySelector(".s-target").value = guess ? guess.id : "new";
@@ -292,7 +345,8 @@ $("upload-file").addEventListener("change", async (e) => {
       if (guess) el.querySelector(".s-target").value = guess.id;
     }
     const sync = () => planSheet(el, i, t);
-    el.querySelector(".s-target").addEventListener("change", sync); sync();
+    el.querySelector(".s-target").addEventListener("change", sync);
+    el.querySelector(".s-on").addEventListener("change", sync); sync();
   });
   $("upload-go").disabled = false;
 });
@@ -303,9 +357,26 @@ async function planSheet(el, i, t) {
   const box = el.querySelector(".s-plan");
   el.querySelector(".s-name").hidden = target !== "new";
   el.plan = null;
-  if (target === "new") { box.innerHTML = ""; el.plan = { mode: "new" }; return; }
-  const ds = state.datasets.find((d) => d.id === +target);
+  if (!el.querySelector(".s-on").checked) { box.innerHTML = ""; el.plan = { skip: true }; return; } // only check sheets that will load
+  const ds = target === "new" ? null : state.datasets.find((d) => d.id === +target);
+  // wrong place? (a subject button, or a subject's table picked by hand)
+  const why = wrongPlace(t, upload.topic || topicOf(ds));
+  if (why) { box.innerHTML = `<div class="blocked">⛔ ${why}<br>הטעינה חסומה.</div>`; el.plan = { blocked: true }; return; }
+  if (!ds) {
+    const looks = TOPICS.find((tp) => t.fits.includes(tp.id));
+    box.innerHTML = !upload.topic && looks ? `<div class="warn">נראה כמו קובץ של ${esc(looks.table)}. כדי שייכנס לטבלה הנכונה, עדיף להשתמש בכפתור "${esc(looks.label)}".</div>` : "";
+    el.plan = { mode: "new" };
+    return;
+  }
   const m = mapToTable(ds, t);
+  // loading into an existing table: most of the file's columns must already be there
+  const fileLabels = t.columns.filter((c) => !c.manual && c.label !== NAME_LABEL).map((c) => c.label);
+  const shared = fileLabels.filter((l) => ds.columns.some((c) => c.label === l)).length;
+  if (ds.columns.length && fileLabels.length && shared / fileLabels.length < 0.5) {
+    box.innerHTML = `<div class="blocked">⛔ העמודות בקובץ לא תואמות לטבלה "${esc(ds.name)}" (רק ${shared} מתוך ${fileLabels.length} עמודות משותפות). כנראה בחרתם טבלה לא נכונה. בחרו טבלה אחרת או "טבלה חדשה".<br>הטעינה חסומה.</div>`;
+    el.plan = { blocked: true };
+    return;
+  }
   box.innerHTML = `<span class="muted">בודק את הטבלה הקיימת…</span>`;
   let existing;
   try { existing = await fetchAll(() => sb.from("dataset_rows").select(m.dateKey ? `id,d:data->>${m.dateKey}` : "id").eq("dataset_id", ds.id).order("id")); }
@@ -344,6 +415,7 @@ $("upload-go").addEventListener("click", async () => {
   if (!jobs.length) return toast("לא נבחר אף גיליון");
   for (const el of jobs) {
     if (!el.plan) return toast("רגע, עדיין בודק את הטבלה הקיימת");
+    if (el.plan.blocked) { el.scrollIntoView({ block: "center" }); return toast("הקובץ לא מתאים לטבלה הזאת, הטעינה חסומה", 4000); }
     if (!el.plan.mode) { el.scrollIntoView({ block: "center" }); return toast(`צריך לבחור מה לעשות עם הנתונים הקיימים בטבלה "${el.plan.ds.name}"`, 4000); }
     if (el.plan.mode === "all" && !confirm(`⚠ למחוק את כל ${el.plan.total} השורות בטבלה "${el.plan.ds.name}" ולהשאיר רק את תוכן הקובץ? אין דרך חזרה.`)) return;
   }
@@ -514,8 +586,8 @@ function startEdit(rowId, col) {
   const row = state.rows.find((r) => r.id === rowId);
   const c = state.ds.columns.find((x) => x.key === col);
   state.editing = { row: rowId, col };
-  if (c.lookup) {
-    const opts = state.lookups?.[c.lookup];
+  if (c.lookup || c.options) {
+    const opts = c.options || state.lookups?.[c.lookup];
     const cur = row.data[col] == null ? "" : String(row.data[col]);
     const list = opts ? [...opts] : [];
     if (cur && !list.includes(cur)) list.unshift(cur); // keep a value that was removed from the list
@@ -526,7 +598,7 @@ function startEdit(rowId, col) {
   }
   const input = td.querySelector("input, select");
   input.focus(); if (input.select && input.tagName === "INPUT") input.select();
-  if (c.lookup) input.addEventListener("change", () => input.blur());
+  if (c.lookup || c.options) input.addEventListener("change", () => input.blur());
   let done = false;
   const finish = async (save) => {
     if (done) return; done = true;
@@ -749,6 +821,7 @@ async function start() {
   $("who").innerHTML = `${esc(user.user_metadata?.full_name || user.email)} · <button class="link-btn" id="logout">התנתקות</button>`;
   try {
     await Promise.all([loadDatasets(), isAdmin ? loadUsers() : null]);
+    await ensureCategories();
     $("status").textContent = "";
     render();
     sb.from("usage_logs").insert({ visitor_name: user.email, action: "page_view" }).then(() => {});
