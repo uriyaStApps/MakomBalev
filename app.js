@@ -54,8 +54,26 @@ function cellValue(v) { // Excel cell -> JSON value
     const d = `${v.getFullYear()}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}`;
     return v.getHours() || v.getMinutes() ? `${d} ${pad(v.getHours())}:${pad(v.getMinutes())}` : d;
   }
-  if (typeof v === "string") return v.trim() === "" ? null : v.trim();
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (s === "") return null;
+    // text from CSV files (bank exports): "1,234.56" -> number, "01/11/2026" -> date (day first, Israeli style)
+    if (/^-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$/.test(s) && !/^-?0\d/.test(s)) return Number(s.replace(/,/g, ""));
+    const d = s.match(/^(\d{1,2})[./](\d{1,2})[./](\d{4})$/);
+    if (d && +d[2] >= 1 && +d[2] <= 12 && +d[1] >= 1 && +d[1] <= 31) return `${d[3]}-${pad(d[2])}-${pad(d[1])}`;
+    return s;
+  }
   return v;
+}
+
+// CSV files from Israeli banks are usually windows-1255, not UTF-8: decode them ourselves
+async function readWorkbook(file) {
+  const buf = await file.arrayBuffer();
+  if (!/\.(csv|txt)$/i.test(file.name)) return XLSX.read(buf, { cellDates: true });
+  let text;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(buf); }
+  catch { text = new TextDecoder("windows-1255").decode(buf); }
+  return XLSX.read(text.replace(/^﻿/, ""), { type: "string", raw: true }); // raw: we parse numbers/dates (day first) ourselves
 }
 function guessType(values) {
   const vals = values.filter((v) => v !== null);
@@ -77,22 +95,32 @@ function parseInput(text, type) {
 }
 
 // ---------------- Excel in ----------------
-function sheetToTable(ws) { // -> { columns, rows } using the first non-empty row as headers
+// -> { columns, rows, skipped }. Bank exports start with title lines (report name, balance, dates...):
+// the header is the first row that is about as wide as the table itself; everything above it is dropped.
+function sheetToTable(ws) {
   const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: false });
-  const hi = aoa.findIndex((r) => r.some((v) => cellValue(v) !== null));
-  if (hi < 0) return { columns: [], rows: [] };
-  const header = aoa[hi];
+  const filled = aoa.map((r) => r.filter((v) => cellValue(v) !== null).length);
+  const widest = Math.max(0, ...filled);
+  if (!widest) return { columns: [], rows: [], skipped: [] };
+  const hi = filled.findIndex((n) => n >= Math.max(2, Math.ceil(widest * 0.6)));
+  const skipped = aoa.slice(0, hi).map((r) => r.map(cellValue).filter((v) => v !== null).join(" ")).filter(Boolean);
+  const header = aoa[hi].map((v) => (v === null || v === undefined ? null : String(v).trim() || null)); // headers stay text
   const body = aoa.slice(hi + 1).map((r) => r.map(cellValue)).filter((r) => r.some((v) => v !== null));
   const width = Math.max(header.length, ...body.map((r) => r.length));
   const columns = [], seen = {};
   for (let i = 0; i < width; i++) {
-    let label = String(cellValue(header[i]) ?? `עמודה ${i + 1}`);
+    if (header[i] === null && body.every((r) => (r[i] ?? null) === null)) continue; // empty column with no title
+    let label = header[i] ?? `עמודה ${i + 1}`;
     if (seen[label]) label = `${label} (${++seen[label]})`; else seen[label] = 1;
-    columns.push({ key: `c${i + 1}`, label, type: guessType(body.map((r) => r[i] ?? null)) });
+    columns.push({ key: `c${i + 1}`, label, type: guessType(body.map((r) => r[i] ?? null)), i });
   }
-  const rows = body.map((r) => Object.fromEntries(columns.map((c, i) => [c.key, r[i] ?? null]).filter(([, v]) => v !== null)));
-  return { columns, rows };
+  const rows = body.map((r) => Object.fromEntries(columns.map((c) => [c.key, r[c.i] ?? null]).filter(([, v]) => v !== null)));
+  columns.forEach((c) => delete c.i);
+  return { columns, rows, skipped };
 }
+// Hebrew that was already lost before the file reached us (saved as "????") can't be recovered
+const lostHebrew = (t) => [...t.columns.map((c) => c.label), ...t.rows.slice(0, 50).flatMap((r) => Object.values(r))]
+  .some((v) => typeof v === "string" && /\?{2,}/.test(v));
 
 let upload = null; // { file, wb, tables: {sheetName: {columns, rows}} }
 $("upload-file").addEventListener("change", async (e) => {
@@ -100,14 +128,17 @@ $("upload-file").addEventListener("change", async (e) => {
   $("upload-sheets").innerHTML = ""; $("upload-go").disabled = true; $("upload-progress").textContent = "";
   if (!file) return;
   try {
-    const wb = XLSX.read(await file.arrayBuffer(), { cellDates: true });
-    upload = { file, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
+    const wb = await readWorkbook(file);
+    upload ={ file, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
   } catch (err) { console.error(err); toast("לא הצלחתי לקרוא את הקובץ"); return; }
   const opts = state.datasets.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
   $("upload-sheets").innerHTML = Object.entries(upload.tables).map(([name, t], i) => {
     const existing = state.datasets.find((d) => d.name === name);
     return `<div class="sheet-opt" data-sheet="${esc(name)}">
       <label><input type="checkbox" class="s-on" ${t.rows.length ? "checked" : ""}> <b>${esc(name)}</b> <span class="muted">${t.rows.length} שורות · ${t.columns.length} עמודות</span></label>
+      ${t.columns.length ? `<div class="muted">עמודות: ${t.columns.map((c) => esc(c.label)).join(" · ")}</div>` : ""}
+      ${t.skipped.length ? `<details class="muted"><summary>${t.skipped.length} שורות כותרת מעל הטבלה הושמטו</summary>${t.skipped.map((s) => `<div>${esc(s)}</div>`).join("")}</details>` : ""}
+      ${lostHebrew(t) ? `<div class="warn">⚠ בקובץ מופיעים סימני שאלה במקום עברית. העברית כבר אבדה בקובץ עצמו (כנראה נשמר מחדש בתוכנה אחרת). כדאי להוריד אותו שוב מהבנק ולהעלות כמו שהוא, בלי לפתוח ולשמור.</div>` : ""}
       <label>לאן: <select class="s-target"><option value="new">טבלה חדשה</option>${opts}</select>
         <input type="text" class="s-name" value="${esc(name)}" placeholder="שם הטבלה"></label>
       <label class="s-mode-wrap" hidden>אופן: <select class="s-mode"><option value="replace">החלפת כל השורות בטבלה</option><option value="append">הוספה לסוף הטבלה</option></select></label>

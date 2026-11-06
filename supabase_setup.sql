@@ -25,7 +25,9 @@ create table if not exists makom_balev.allowed_users (
   added_by text default (auth.jwt() ->> 'email'),
   added_at timestamptz not null default now()
 );
-insert into makom_balev.allowed_users (email, is_admin) values ('uriya19@gmail.com', true)
+insert into makom_balev.allowed_users (email, full_name, is_admin) values
+  ('uriya19@gmail.com', 'אוריה', true),
+  ('siegelyoel@gmail.com', 'יואל זיגל', true)
   on conflict (email) do update set is_admin = true;
 
 create or replace function makom_balev.is_allowed() returns boolean
