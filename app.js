@@ -35,8 +35,9 @@ function extractName(s) {
 }
 const NAME_LABEL = "שם";
 function nameFromRow(row, columns) {
-  // look in "יתרה בש"ח" first (where the bank puts these details), then in any other text column
-  const order = [...columns.filter((c) => c.label.includes("יתרה")), ...columns.filter((c) => !c.label.includes("יתרה"))];
+  // look in "תיאור מורחב" first (where Leumi puts these details), then in any other text column
+  const first = (c) => /תיאור מורחב/.test(c.label);
+  const order = [...columns.filter(first), ...columns.filter((c) => !first(c))];
   for (const c of order) {
     if (c.label === NAME_LABEL) continue;
     const n = extractName(row[c.key]);
@@ -47,17 +48,22 @@ function nameFromRow(row, columns) {
 // adds/fills the "שם" column of a parsed table ({columns, rows}); fills only empty names
 function deriveCashFlow(t) {
   if (!t.columns.length) return 0;
+  // a file that already has its own category column (e.g. category / month / type / amount) keeps it as is
+  const own = t.columns.find((c) => /category|קטגורי|סיווג/i.test(c.label) && !c.manual && c.label !== CATEGORY_COL.label);
+  if (!own) {
+    const cat = t.columns.find((c) => c.label === CATEGORY_COL.label);
+    if (!cat) t.columns.push({ key: nextKey(t.columns), ...CATEGORY_COL });
+    else Object.assign(cat, CATEGORY_COL);
+  }
   let col = t.columns.find((c) => c.label === NAME_LABEL);
-  if (!col) { col = { key: nextKey(t.columns), label: NAME_LABEL, type: "text" }; t.columns.push(col); }
-  const cat = t.columns.find((c) => c.label === CATEGORY_COL.label);
-  if (!cat) t.columns.push({ key: nextKey(t.columns), ...CATEGORY_COL });
-  else Object.assign(cat, CATEGORY_COL);
+  const key = col ? col.key : nextKey(t.columns);
   let n = 0;
   for (const r of t.rows) {
-    if (r[col.key] != null) continue;
+    if (r[key] != null) continue;
     const name = nameFromRow(r, t.columns);
-    if (name) { r[col.key] = name; n++; }
+    if (name) { r[key] = name; n++; }
   }
+  if (!col && n) t.columns.push({ key, label: NAME_LABEL, type: "text" }); // only when there is something to show
   return n;
 }
 const topicOf = (ds) => ds && TOPICS.find((tp) => tp.table === ds.name);
@@ -158,12 +164,17 @@ function sheetToTable(ws) {
   if (!widest) return { columns: [], rows: [], skipped: [] };
   const hi = filled.findIndex((n) => n >= Math.max(2, Math.ceil(widest * 0.6)));
   const skipped = aoa.slice(0, hi).map((r) => r.map(cellValue).filter((v) => v !== null).join(" ")).filter(Boolean);
-  const header = aoa[hi].map((v) => (v === null || v === undefined ? null : String(v).trim() || null)); // headers stay text
+  let header = aoa[hi].map((v) => (v === null || v === undefined ? null : String(v).trim() || null)); // headers stay text
   const body = aoa.slice(hi + 1).map((r) => r.map(cellValue)).filter((r) => r.some((v) => v !== null));
+  // Leumi's CSV: the header row starts one cell later than the data rows -> every title lands one column off.
+  // If the header has more empty cells in front than any data row, line it up with the data.
+  const lead = (r) => { const i = r.findIndex((v) => v !== null && v !== undefined); return i < 0 ? Infinity : i; };
+  const shift = lead(header) - Math.min(...body.map(lead));
+  if (body.length && shift > 0 && shift < Infinity) header = header.slice(shift);
   const width = Math.max(header.length, ...body.map((r) => r.length));
   const columns = [], seen = {};
   for (let i = 0; i < width; i++) {
-    if (header[i] === null && body.every((r) => (r[i] ?? null) === null)) continue; // empty column with no title
+    if (header[i] == null && body.every((r) => (r[i] ?? null) === null)) continue; // empty column with no title
     let label = header[i] ?? `עמודה ${i + 1}`;
     if (seen[label]) label = `${label} (${++seen[label]})`; else seen[label] = 1;
     columns.push({ key: `c${i + 1}`, label, type: guessType(body.map((r) => r[i] ?? null)), i });
@@ -203,8 +214,8 @@ function mapToTable(ds, t) {
 const rowSig = (m, data) => JSON.stringify(m.sigKeys.map((k) => data[k] ?? null));
 // before deleting rows for a reload: remember hand-filled values (e.g. Category) per identical row
 async function rememberManual(ds, m, plan) {
-  const manual = m.cols.filter((c) => c.manual).map((c) => c.key);
-  if (!manual.length) return null;
+  const manualCols = m.cols.filter((c) => c.manual);
+  if (!manualCols.length) return null;
   const old = await fetchAll(() => {
     let q = sb.from("dataset_rows").select("id,data").eq("dataset_id", ds.id);
     if (plan.mode === "period") q = q.gte(`data->>${m.dateKey}`, plan.range.from).lt(`data->>${m.dateKey}`, plan.range.to + "~");
@@ -212,7 +223,7 @@ async function rememberManual(ds, m, plan) {
   });
   const keep = new Map();
   for (const r of old) {
-    const vals = Object.fromEntries(manual.filter((k) => r.data[k] != null).map((k) => [k, r.data[k]]));
+    const vals = Object.fromEntries(manualCols.filter((c) => r.data[c.key] != null).map((c) => [c.label, r.data[c.key]])); // by title: keys may change
     if (!Object.keys(vals).length) continue;
     const s = rowSig(m, r.data);
     if (!keep.has(s)) keep.set(s, []);
@@ -224,7 +235,9 @@ function restoreManual(m, keep) {
   let n = 0;
   for (const r of m.rows) {
     const vals = keep.get(rowSig(m, r))?.shift();
-    if (vals) { Object.assign(r, vals); n++; }
+    if (!vals) continue;
+    for (const [label, v] of Object.entries(vals)) { const c = m.cols.find((x) => x.label === label); if (c) r[c.key] = v; }
+    n++;
   }
   return n;
 }
@@ -348,8 +361,10 @@ $("upload-go").addEventListener("click", async () => {
         lastId = data.id;
         continue;
       }
-      const { ds, m } = plan;
-      const keep = plan.mode === "all" || plan.mode === "period" ? await rememberManual(ds, m, plan) : null;
+      const { ds } = plan;
+      const keep = plan.mode === "all" || plan.mode === "period" ? await rememberManual(ds, plan.m, plan) : null;
+      // overwriting everything also resets the column list to the file's columns (fixes a table loaded with shifted titles)
+      const m = plan.mode === "all" ? mapToTable({ ...ds, columns: [] }, t) : plan.m;
       if (plan.mode === "all") {
         const { error } = await sb.from("dataset_rows").delete().eq("dataset_id", ds.id);
         if (error) throw error;
@@ -674,13 +689,16 @@ $("view-users").addEventListener("click", async (e) => {
 // ---------------- tabs / render ----------------
 document.querySelector(".tabs").addEventListener("click", (e) => {
   const b = e.target.closest(".tab"); if (!b) return;
-  state.tab = b.dataset.tab; render();
+  state.tab = b.dataset.tab;
+  if (state.tab === "reports" && typeof rep !== "undefined") rep.cache = {}; // always report on the latest data
+  render();
 });
 function render() {
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === state.tab));
-  $("view-tables").hidden = state.tab !== "tables";
-  $("view-users").hidden = state.tab !== "users";
-  if (state.tab === "tables") renderTables(); else renderUsers();
+  for (const v of ["tables", "reports", "users"]) $(`view-${v}`).hidden = state.tab !== v;
+  if (state.tab === "tables") renderTables();
+  else if (state.tab === "reports") renderReports();
+  else renderUsers();
 }
 
 // ---------------- sign-in ----------------
