@@ -9,8 +9,57 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
 
 // one upload button per subject; each subject loads into its own table
 const TOPICS = [
-  { id: "cashflow", label: "טעינת cash flow", table: "Cash Flow" },
+  { id: "cashflow", label: "טעינת cash flow", table: "Cash Flow", derive: deriveCashFlow },
+  { id: "categories", label: "טעינת קטגוריות", table: "Categories" },
 ];
+// Cash Flow's "Category" is chosen by hand from the Categories table (manual = kept when the period is reloaded)
+const CATEGORY_COL = { label: "Category", type: "text", lookup: "Categories", manual: true };
+
+// ---------------- Cash Flow: who the money came from / went to ----------------
+// "העברה מאת: דן שפר, מרינה שפ 10-843-003918627 תרומה"            -> "דן שפר"
+// "העברה מאת: BANK OF AMERICA CORPOR 10-800-022004542"            -> "BANK OF AMERICA CORPOR"
+// "מתאריך 28/10/26 12:46 בכרטיס המסתיים ב-4045 ב-בישולים ותבשילים בע"מ" -> "בישולים ותבשילים בע"מ"
+function extractName(s) {
+  if (typeof s !== "string") return null;
+  let m = s.match(/(?:^|\s)(?:מאת|אל)\s*:\s*(.+)/); // whole word only ("ישראל:" is not "אל:")
+  if (m) {
+    let x = m[1].split(/\s+\d{1,3}-\d{2,3}-\d{3,}/)[0]; // stop at the bank account number
+    x = x.split(/[,،]/)[0];                            // several account holders: keep the first
+    x = x.replace(/[\s:.\-]+$/, "").trim();
+    return x || null;
+  }
+  m = s.match(/המסתיים\s+ב-?\s*\d+\s+ב-?\s*(.+)/);   // card purchase: the business name
+  if (m) return m[1].replace(/[\s:.]+$/, "").trim() || null;
+  return null;
+}
+const NAME_LABEL = "שם";
+function nameFromRow(row, columns) {
+  // look in "יתרה בש"ח" first (where the bank puts these details), then in any other text column
+  const order = [...columns.filter((c) => c.label.includes("יתרה")), ...columns.filter((c) => !c.label.includes("יתרה"))];
+  for (const c of order) {
+    if (c.label === NAME_LABEL) continue;
+    const n = extractName(row[c.key]);
+    if (n) return n;
+  }
+  return null;
+}
+// adds/fills the "שם" column of a parsed table ({columns, rows}); fills only empty names
+function deriveCashFlow(t) {
+  if (!t.columns.length) return 0;
+  let col = t.columns.find((c) => c.label === NAME_LABEL);
+  if (!col) { col = { key: nextKey(t.columns), label: NAME_LABEL, type: "text" }; t.columns.push(col); }
+  const cat = t.columns.find((c) => c.label === CATEGORY_COL.label);
+  if (!cat) t.columns.push({ key: nextKey(t.columns), ...CATEGORY_COL });
+  else Object.assign(cat, CATEGORY_COL);
+  let n = 0;
+  for (const r of t.rows) {
+    if (r[col.key] != null) continue;
+    const name = nameFromRow(r, t.columns);
+    if (name) { r[col.key] = name; n++; }
+  }
+  return n;
+}
+const topicOf = (ds) => ds && TOPICS.find((tp) => tp.table === ds.name);
 const SHOW = 200;     // rows rendered at a time
 const CHUNK = 500;    // rows per insert request
 const state = { tab: "tables", datasets: [], counts: {}, ds: null, rows: [], q: "", sort: null, shown: SHOW, users: [], editing: null };
@@ -140,18 +189,49 @@ function mapToTable(ds, t) {
   const map = {};
   for (const c of t.columns) {
     let hit = cols.find((x) => x.label === c.label);
-    if (!hit) { hit = { key: nextKey(cols), label: c.label, type: c.type }; cols.push(hit); }
+    if (!hit) { hit = { ...c, key: nextKey(cols) }; cols.push(hit); }
+    else if (c.lookup) Object.assign(hit, { lookup: c.lookup, manual: c.manual });
     map[c.key] = hit.key;
   }
   const rows = t.rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [map[k], v])));
   const fileDate = t.columns.find((c) => c.type === "date");
-  return { cols, rows, dateKey: fileDate ? map[fileDate.key] : null };
+  // the bank's own columns identify a row; used to carry hand-picked values over when a period is reloaded
+  const sigKeys = t.columns.filter((c) => !c.manual && c.label !== NAME_LABEL).map((c) => map[c.key]);
+  return { cols, rows, dateKey: fileDate ? map[fileDate.key] : null, sigKeys };
+}
+const rowSig = (m, data) => JSON.stringify(m.sigKeys.map((k) => data[k] ?? null));
+// before deleting rows for a reload: remember hand-filled values (e.g. Category) per identical row
+async function rememberManual(ds, m, plan) {
+  const manual = m.cols.filter((c) => c.manual).map((c) => c.key);
+  if (!manual.length) return null;
+  const old = await fetchAll(() => {
+    let q = sb.from("dataset_rows").select("id,data").eq("dataset_id", ds.id);
+    if (plan.mode === "period") q = q.gte(`data->>${m.dateKey}`, plan.range.from).lt(`data->>${m.dateKey}`, plan.range.to + "~");
+    return q.order("id");
+  });
+  const keep = new Map();
+  for (const r of old) {
+    const vals = Object.fromEntries(manual.filter((k) => r.data[k] != null).map((k) => [k, r.data[k]]));
+    if (!Object.keys(vals).length) continue;
+    const s = rowSig(m, r.data);
+    if (!keep.has(s)) keep.set(s, []);
+    keep.get(s).push(vals);
+  }
+  return keep;
+}
+function restoreManual(m, keep) {
+  let n = 0;
+  for (const r of m.rows) {
+    const vals = keep.get(rowSig(m, r))?.shift();
+    if (vals) { Object.assign(r, vals); n++; }
+  }
+  return n;
 }
 // the existing table that most likely receives this sheet: same name, or the same column headers
 function guessTarget(name, t) {
   const byName = state.datasets.find((d) => d.name === name);
   if (byName) return byName;
-  const labels = t.columns.map((c) => c.label);
+  const labels = t.columns.filter((c) => !c.manual && c.label !== NAME_LABEL).map((c) => c.label); // "שם"/"Category" are ours, not the bank's
   return labels.length ? state.datasets.find((d) => labels.every((l) => d.columns.some((c) => c.label === l))) : null;
 }
 
@@ -163,6 +243,7 @@ $("upload-file").addEventListener("change", async (e) => {
     const wb = await readWorkbook(file);
     upload = { file, topic: uploadTopic, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
   } catch (err) { console.error(err); toast("לא הצלחתי לקרוא את הקובץ"); return; }
+  if (upload.topic?.derive) Object.values(upload.tables).forEach((t) => upload.topic.derive(t));
   const opts = state.datasets.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
   $("upload-sheets").innerHTML = Object.entries(upload.tables).map(([name, t]) => {
     const dc = t.columns.find((c) => c.type === "date");
@@ -229,7 +310,7 @@ async function planSheet(el, i, t) {
       הקובץ: <b>${dmy(fileR.from)} – ${dmy(fileR.to)}</b>, ${m.rows.length} שורות.<br>
       ${plan.overlap ? `<b class="warn">${plan.overlap} שורות בטבלה נמצאות בתוך טווח התאריכים של הקובץ.</b>` : "אין חפיפה בתאריכים בין הקובץ לטבלה."}`;
     if (plan.overlap) periodOpt = `<label class="opt"><input type="radio" name="mode${i}" value="period">
-      <span><b>החלפת התקופה ${dmy(fileR.from)} – ${dmy(fileR.to)}</b> (מומלץ): ${plan.overlap} השורות האלה יוחלפו בשורות מהקובץ, והשורות מחוץ לתקופה יישארו. שימו לב: גם שורות שנוספו באתר בתקופה הזאת יוחלפו.</span></label>`;
+      <span><b>החלפת התקופה ${dmy(fileR.from)} – ${dmy(fileR.to)}</b> (מומלץ): ${plan.overlap} השורות האלה יוחלפו בשורות מהקובץ, והשורות מחוץ לתקופה יישארו. שימו לב: גם שורות שנוספו באתר בתקופה הזאת יוחלפו.${m.cols.some((c) => c.manual) ? " ערכים שבחרתם ידנית (Category) יישמרו לשורות שמופיעות שוב בקובץ." : ""}</span></label>`;
   } else {
     info = `בטבלה "${esc(ds.name)}" יש כבר <b>${existing.length}</b> שורות${m.dateKey ? "" : " (אין עמודת תאריך להשוואה)"}.`;
   }
@@ -238,7 +319,7 @@ async function planSheet(el, i, t) {
     <label class="opt"><input type="radio" name="mode${i}" value="append">
       <span><b>הוספה בלבד</b>: כל ${m.rows.length} שורות הקובץ יתווספו, בלי למחוק כלום${plan.overlap ? `. <span class="warn">שורות בתקופה החופפת יופיעו פעמיים.</span>` : "."}</span></label>
     <label class="opt danger-opt"><input type="radio" name="mode${i}" value="all">
-      <span><b>⚠ דריסת כל הטבלה</b>: מחיקת כל ${existing.length} השורות הקיימות (כולל מה שנוסף באתר) והשארת תוכן הקובץ בלבד. אין דרך חזרה.</span></label>
+      <span><b>⚠ דריסת כל הטבלה</b>: מחיקת כל ${existing.length} השורות הקיימות (כולל מה שנוסף באתר) והשארת תוכן הקובץ בלבד. אין דרך חזרה.${m.cols.some((c) => c.manual) ? " (Category שנבחר ידנית יישמר רק לשורות שמופיעות שוב בקובץ.)" : ""}</span></label>
   </div>`;
   box.querySelectorAll("input[type=radio]").forEach((r) => r.addEventListener("change", () => { plan.mode = r.value; }));
 }
@@ -266,6 +347,7 @@ $("upload-go").addEventListener("click", async () => {
         continue;
       }
       const { ds, m } = plan;
+      const keep = plan.mode === "all" || plan.mode === "period" ? await rememberManual(ds, m, plan) : null;
       if (plan.mode === "all") {
         const { error } = await sb.from("dataset_rows").delete().eq("dataset_id", ds.id);
         if (error) throw error;
@@ -275,6 +357,7 @@ $("upload-go").addEventListener("click", async () => {
           .gte(`data->>${m.dateKey}`, plan.range.from).lt(`data->>${m.dateKey}`, plan.range.to + "~"); // "~" sorts after any time part
         if (error) throw error;
       }
+      if (keep) restoreManual(m, keep);
       const patch = { columns: m.cols, source_file: upload.file.name };
       if (upload.topic && ds.name !== upload.topic.table) patch.name = upload.topic.table; // a matching table loaded before the subject buttons existed
       const { error } = await sb.from("datasets").update(patch).eq("id", ds.id);
@@ -334,9 +417,25 @@ async function openDataset(id) {
   state.ds = state.datasets.find((d) => d.id === id);
   state.q = ""; state.sort = null; state.shown = SHOW; state.editing = null;
   $("status").textContent = "טוען…";
-  try { state.rows = await loadRows(id); $("status").textContent = ""; }
+  try {
+    state.rows = await loadRows(id);
+    await loadLookups(state.ds);
+    $("status").textContent = "";
+  }
   catch (err) { console.error(err); $("status").textContent = "שגיאה בטעינת הטבלה"; state.rows = []; }
   render();
+}
+
+// dropdown options for lookup columns (e.g. Category <- the Categories table)
+async function loadLookups(ds) {
+  state.lookups = {};
+  for (const c of ds.columns.filter((x) => x.lookup)) {
+    const src = state.datasets.find((d) => d.name === c.lookup);
+    if (!src) { state.lookups[c.lookup] = null; continue; }
+    const col = src.columns.find((x) => /category|קטגורי|סיווג/i.test(x.label)) || src.columns[0];
+    const rows = col ? await loadRows(src.id) : [];
+    state.lookups[c.lookup] = [...new Set(rows.map((r) => r.data[col.key]).filter((v) => v != null).map(String))];
+  }
 }
 
 function filteredRows() {
@@ -378,6 +477,7 @@ function renderTables() {
       <button class="btn primary" id="btn-add-row">+ שורה</button>
       <button class="btn" id="btn-add-col">+ עמודה</button>
       <button class="btn" id="btn-dl">⬇ אקסל</button>
+      ${topicOf(ds)?.derive ? `<button class="btn" id="btn-derive" title="ממלא את עמודת &quot;שם&quot; בשורות שבהן היא ריקה">🔄 חילוץ שמות</button>` : ""}
       <button class="btn" id="btn-rename">שינוי שם</button>
       ${isAdmin ? `<button class="btn danger" id="btn-del-ds">מחיקת טבלה</button>` : ""}
     </div>
@@ -397,9 +497,19 @@ function startEdit(rowId, col) {
   const row = state.rows.find((r) => r.id === rowId);
   const c = state.ds.columns.find((x) => x.key === col);
   state.editing = { row: rowId, col };
-  td.innerHTML = `<input type="text" value="${esc(showValue(row.data[col], c.type))}" ${c.type === "number" ? 'dir="ltr"' : ""} placeholder="${c.type === "date" ? "dd/mm/yyyy" : ""}">`;
-  const input = td.querySelector("input");
-  input.focus(); input.select();
+  if (c.lookup) {
+    const opts = state.lookups?.[c.lookup];
+    const cur = row.data[col] == null ? "" : String(row.data[col]);
+    const list = opts ? [...opts] : [];
+    if (cur && !list.includes(cur)) list.unshift(cur); // keep a value that was removed from the list
+    td.innerHTML = `<select><option value="">${opts ? (opts.length ? "— בחירה —" : `— אין עדיין ערכים בטבלה ${esc(c.lookup)} —`) : `— צריך קודם לטעון את טבלת ${esc(c.lookup)} —`}</option>
+      ${list.map((v) => `<option${v === cur ? " selected" : ""}>${esc(v)}</option>`).join("")}</select>`;
+  } else {
+    td.innerHTML = `<input type="text" value="${esc(showValue(row.data[col], c.type))}" ${c.type === "number" ? 'dir="ltr"' : ""} placeholder="${c.type === "date" ? "dd/mm/yyyy" : ""}">`;
+  }
+  const input = td.querySelector("input, select");
+  input.focus(); if (input.select && input.tagName === "INPUT") input.select();
+  if (c.lookup) input.addEventListener("change", () => input.blur());
   let done = false;
   const finish = async (save) => {
     if (done) return; done = true;
@@ -457,6 +567,7 @@ $("view-tables").addEventListener("click", async (e) => {
     if (state.ds.columns.some((c) => c.label === label)) return toast("כבר יש עמודה בשם הזה");
     return saveColumns([...state.ds.columns, { key: nextKey(state.ds.columns), label, type: "text" }]);
   }
+  if (t.closest("#btn-derive")) return deriveExisting(t.closest("#btn-derive"));
   if (t.closest("#btn-rename")) {
     const name = prompt("שם חדש לטבלה:", state.ds.name)?.trim(); if (!name || name === state.ds.name) return;
     const { error } = await sb.from("datasets").update({ name }).eq("id", state.ds.id);
@@ -482,6 +593,34 @@ $("view-tables").addEventListener("input", (e) => {
   state.q = e.target.value; state.shown = SHOW; render();
   const q = $("q"); q.focus(); q.setSelectionRange(q.value.length, q.value.length);
 });
+// run the subject's derive rule on rows already in the table (e.g. loaded before the rule existed)
+async function deriveExisting(btn) {
+  const ds = state.ds, tp = topicOf(ds);
+  const t = { columns: ds.columns.map((c) => ({ ...c })), rows: state.rows.map((r) => ({ ...r.data })) };
+  const found = tp.derive(t);
+  btn.disabled = true;
+  try {
+    if (JSON.stringify(t.columns) !== JSON.stringify(ds.columns)) { // e.g. the "שם" / "Category" columns were just added
+      const { error } = await sb.from("datasets").update({ columns: t.columns }).eq("id", ds.id);
+      if (error) throw error;
+      ds.columns = t.columns;
+      await loadLookups(ds);
+    }
+    if (!found) { btn.disabled = false; render(); return toast("לא נמצאו שמות חדשים לחילוץ"); }
+    const changed = state.rows.map((r, i) => [r, t.rows[i]]).filter(([r, d]) => JSON.stringify(r.data) !== JSON.stringify(d));
+    for (let i = 0; i < changed.length; i += 10) {
+      await Promise.all(changed.slice(i, i + 10).map(async ([r, data]) => {
+        const { error } = await sb.from("dataset_rows").update({ data }).eq("id", r.id);
+        if (error) throw error;
+        r.data = data;
+      }));
+      $("status").textContent = `מעדכן שמות… ${Math.min(i + 10, changed.length)}/${changed.length}`;
+    }
+    $("status").textContent = "";
+    toast(`נמצאו שמות ל-${changed.length} שורות`);
+  } catch (err) { console.error(err); $("status").textContent = ""; toast("העדכון נכשל באמצע, אפשר ללחוץ שוב"); }
+  render();
+}
 async function saveColumns(columns) {
   const { error } = await sb.from("datasets").update({ columns }).eq("id", state.ds.id);
   if (error) return toast("השמירה נכשלה");
