@@ -7,6 +7,10 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { detectSessionInUrl: false }, // handled in consumeAuthRedirect()
 });
 
+// one upload button per subject; each subject loads into its own table
+const TOPICS = [
+  { id: "cashflow", label: "טעינת cash flow", table: "Cash Flow" },
+];
 const SHOW = 200;     // rows rendered at a time
 const CHUNK = 500;    // rows per insert request
 const state = { tab: "tables", datasets: [], counts: {}, ds: null, rows: [], q: "", sort: null, shown: SHOW, users: [], editing: null };
@@ -122,7 +126,8 @@ function sheetToTable(ws) {
 const lostHebrew = (t) => [...t.columns.map((c) => c.label), ...t.rows.slice(0, 50).flatMap((r) => Object.values(r))]
   .some((v) => typeof v === "string" && /\?{2,}/.test(v));
 
-let upload = null; // { file, tables: {sheetName: {columns, rows, skipped}} }
+let upload = null; // { file, topic, tables: {sheetName: {columns, rows, skipped}} }
+let uploadTopic = null; // the subject button that opened the dialog (null = general upload)
 const dmy = (iso) => iso ? iso.slice(0, 10).split("-").reverse().join("/") : "";
 const day = (v) => (typeof v === "string" && /^\d{4}-\d\d-\d\d/.test(v) ? v.slice(0, 10) : null);
 function dateRange(values) {
@@ -156,7 +161,7 @@ $("upload-file").addEventListener("change", async (e) => {
   if (!file) return;
   try {
     const wb = await readWorkbook(file);
-    upload = { file, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
+    upload = { file, topic: uploadTopic, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
   } catch (err) { console.error(err); toast("לא הצלחתי לקרוא את הקובץ"); return; }
   const opts = state.datasets.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
   $("upload-sheets").innerHTML = Object.entries(upload.tables).map(([name, t]) => {
@@ -173,10 +178,23 @@ $("upload-file").addEventListener("change", async (e) => {
       <div class="s-plan"></div>
     </div>`;
   }).join("");
+  const topic = upload.topic;
+  let first = true;
   document.querySelectorAll(".sheet-opt").forEach((el, i) => {
     const t = upload.tables[el.dataset.sheet];
-    const guess = guessTarget(el.dataset.sheet, t);
-    if (guess) el.querySelector(".s-target").value = guess.id;
+    if (topic) {
+      // subject upload: the (first non-empty) sheet goes into the subject's table, created on the first load
+      const on = first && t.rows.length > 0; if (on) first = false;
+      el.querySelector(".s-on").checked = on;
+      const guess = state.datasets.find((d) => d.name === topic.table) || guessTarget(el.dataset.sheet, t);
+      el.querySelector(".s-target").value = guess ? guess.id : "new";
+      el.querySelector(".s-name").value = topic.table;
+      el.querySelector(".s-target").closest("label").hidden = true;
+      if (Object.keys(upload.tables).length === 1) el.querySelector(".s-on").closest("label").querySelector("input").hidden = true;
+    } else {
+      const guess = guessTarget(el.dataset.sheet, t);
+      if (guess) el.querySelector(".s-target").value = guess.id;
+    }
     const sync = () => planSheet(el, i, t);
     el.querySelector(".s-target").addEventListener("change", sync); sync();
   });
@@ -257,7 +275,9 @@ $("upload-go").addEventListener("click", async () => {
           .gte(`data->>${m.dateKey}`, plan.range.from).lt(`data->>${m.dateKey}`, plan.range.to + "~"); // "~" sorts after any time part
         if (error) throw error;
       }
-      const { error } = await sb.from("datasets").update({ columns: m.cols, source_file: upload.file.name }).eq("id", ds.id);
+      const patch = { columns: m.cols, source_file: upload.file.name };
+      if (upload.topic && ds.name !== upload.topic.table) patch.name = upload.topic.table; // a matching table loaded before the subject buttons existed
+      const { error } = await sb.from("datasets").update(patch).eq("id", ds.id);
       if (error) throw error;
       await insertRows(ds.id, m.rows, "excel");
       lastId = ds.id;
@@ -273,8 +293,9 @@ $("upload-go").addEventListener("click", async () => {
   } finally { $("upload-go").disabled = false; }
 });
 $("upload-cancel").addEventListener("click", () => $("upload-dlg").close());
-function openUpload() {
-  upload = null; $("upload-file").value = ""; $("upload-sheets").innerHTML = ""; $("upload-progress").textContent = ""; $("upload-go").disabled = true;
+function openUpload(topic = null) {
+  upload = null; uploadTopic = topic;
+  $("upload-title").textContent = topic ? topic.label : "טעינת קובץ"; $("upload-file").value = ""; $("upload-sheets").innerHTML = ""; $("upload-progress").textContent = ""; $("upload-go").disabled = true;
   $("upload-dlg").showModal();
 }
 
@@ -337,13 +358,14 @@ function renderTables() {
   const el = $("view-tables");
   if (!state.ds) {
     el.innerHTML = `<div class="toolbar"><h2>טבלאות</h2>
-      <button class="btn primary" id="btn-upload">⬆ העלאת אקסל</button>
+      ${TOPICS.map((tp) => `<button class="btn primary" data-topic="${tp.id}">⬆ ${esc(tp.label)}</button>`).join("")}
+      <button class="btn" id="btn-upload">⬆ טעינת קובץ אחר</button>
       ${state.datasets.length ? `<button class="btn" id="btn-dl-all">⬇ הורדת הכול לאקסל</button>` : ""}</div>
       ${state.datasets.length ? `<div class="grid-cards">${state.datasets.map((d) => `
         <div class="card ds-card" data-open="${d.id}"><h3>${esc(d.name)}</h3>
         <div class="muted">${state.counts[d.id] ?? 0} שורות · ${d.columns.length} עמודות</div>
         <div class="muted">עודכן ${fmtDate(d.updated_at)}${d.source_file ? ` · מקור: ${esc(d.source_file)}` : ""}</div></div>`).join("")}</div>`
-      : `<div class="card empty">עדיין אין טבלאות. לחצו על "העלאת אקסל" כדי לטעון קובץ.</div>`}`;
+      : `<div class="card empty">עדיין אין טבלאות. לחצו על כפתור הטעינה של הנושא (למשל "${esc(TOPICS[0].label)}") כדי לטעון קובץ.</div>`}`;
     return;
   }
   const { ds } = state;
@@ -403,6 +425,7 @@ function startEdit(rowId, col) {
 $("view-tables").addEventListener("click", async (e) => {
   const t = e.target;
   if (t.closest("#btn-upload")) return openUpload();
+  const tp = t.closest("[data-topic]"); if (tp) return openUpload(TOPICS.find((x) => x.id === tp.dataset.topic));
   if (t.closest("#btn-dl-all")) return downloadAll();
   const card = t.closest("[data-open]"); if (card) return openDataset(+card.dataset.open);
   if (t.closest("#btn-back")) { state.ds = null; await loadDatasets(); return render(); }
