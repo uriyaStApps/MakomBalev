@@ -207,7 +207,7 @@ async function downloadAll() {
   try {
     const sheets = [];
     for (const ds of state.datasets) sheets.push([ds, await loadRows(ds.id)]);
-    saveWorkbook(sheets, `MakomBalev_${stamp()}.xlsx`);
+    saveWorkbook(sheets, `מקום בלב_${stamp()}.xlsx`);
   } catch (err) { console.error(err); toast("ההורדה נכשלה"); }
 }
 
