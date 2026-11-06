@@ -267,7 +267,12 @@ function cellValue(v) { // Excel cell -> JSON value
 // CSV files from Israeli banks are usually windows-1255, not UTF-8: decode them ourselves
 async function readWorkbook(file) {
   const buf = await file.arrayBuffer();
-  if (!/\.(csv|txt)$/i.test(file.name)) return XLSX.read(buf, { cellDates: true });
+  // Bank "xls" exports are often an HTML table. Read as-is, the library turns the text "01/11/2026" into
+  // January 11 (US month-first) and swaps day/month of every date with a day <= 12. So any text-based file
+  // (CSV, HTML) is read with raw: true and its dates are parsed by cellValue(), day first.
+  const head = new Uint8Array(buf.slice(0, 512));
+  const looksText = !(head[0] === 0x50 && head[1] === 0x4b) && !(head[0] === 0xd0 && head[1] === 0xcf); // not a zip (xlsx) or OLE (old xls)
+  if (!/\.(csv|txt)$/i.test(file.name) && !looksText) return XLSX.read(buf, { cellDates: true });
   let text;
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(buf); }
   catch { text = new TextDecoder("windows-1255").decode(buf); }
@@ -395,7 +400,9 @@ function mapToTable(ds, t) {
   const sigKeys = t.columns.filter((c) => !c.manual && c.label !== NAME_LABEL).map((c) => map[c.key]);
   return { cols, rows, dateKey: fileDate ? map[fileDate.key] : null, sigKeys };
 }
-const rowSig = (m, data) => JSON.stringify(m.sigKeys.map((k) => data[k] ?? null));
+// a date counts the same with day and month swapped, so rows stored with swapped dates still match their fixed reload
+const sigVal = (v) => { const d = typeof v === "string" && v.match(/^(\d{4})-(\d\d)-(\d\d)$/); return d ? `${d[1]}|${[d[2], d[3]].sort().join("|")}` : v ?? null; };
+const rowSig = (m, data) => JSON.stringify(m.sigKeys.map((k) => sigVal(data[k])));
 // before deleting rows for a reload: remember hand-filled values (e.g. Category) per identical row
 async function rememberManual(ds, m, plan) {
   const manualCols = m.cols.filter((c) => c.manual);
@@ -601,6 +608,13 @@ async function planSheet(el, i, t) {
 
   // Uriya: card files come one month at a time and are a lot of work to reload -> never offer wiping a card table
   const noWipe = (upload.topic || topicOf(ds))?.kind === "card";
+  // bank files list the newest first: many backward jumps mean the dates were misread (day/month swapped)
+  let orderWarn = "";
+  if ((upload.topic || topicOf(ds))?.kind === "bank" && m.dateKey) {
+    const ds_ = m.rows.map((r) => day(r[m.dateKey])).filter(Boolean);
+    const jumps = ds_.filter((d, j) => j && (new Date(d) - new Date(ds_[j - 1])) / 864e5 > 7).length;
+    if (jumps > 3) orderWarn = `<div class="blocked">⚠ התאריכים בקובץ לא מסודרים כמו בקובץ בנק (${jumps} קפיצות). ייתכן שיום וחודש התהפכו. כדאי לבדוק לפני טעינה.</div>`;
+  }
   const fileR = m.dateKey && dateRange(m.rows.map((r) => r[m.dateKey]));
   const tableR = m.dateKey && dateRange(existing.map((r) => r.d));
   let info, periodOpt = "";
@@ -615,7 +629,7 @@ async function planSheet(el, i, t) {
   } else {
     info = `בטבלה "${esc(ds.name)}" יש כבר <b>${existing.length}</b> שורות${m.dateKey ? "" : " (אין עמודת תאריך להשוואה)"}.`;
   }
-  box.innerHTML = `<div class="plan-box"><div>${info}</div><div class="muted">מה לעשות? (חובה לבחור)</div>
+  box.innerHTML = `${orderWarn}<div class="plan-box"><div>${info}</div><div class="muted">מה לעשות? (חובה לבחור)</div>
     ${periodOpt}
     <label class="opt"><input type="radio" name="mode${i}" value="append">
       <span><b>הוספה בלבד</b>: כל ${m.rows.length} שורות הקובץ יתווספו, בלי למחוק כלום${plan.overlap ? `. <span class="warn">שורות בתקופה החופפת יופיעו פעמיים.</span>` : "."}</span></label>
