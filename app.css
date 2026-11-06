@@ -7,6 +7,7 @@
     --accent: #e0707e; --accent-ink: #16171a; --soft: #2b2023; }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 Heebo, system-ui, sans-serif; }
 .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; background: var(--card); border-bottom: 1px solid var(--line); }
 .top h1 { margin: 0; font-size: 22px; color: var(--accent); letter-spacing: .3px; }
