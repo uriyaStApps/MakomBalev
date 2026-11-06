@@ -816,6 +816,7 @@ function renderTables() {
       ${topicOf(ds)?.derive ? `<button class="btn" id="btn-derive" title="ממלא את עמודת &quot;שם&quot; בשורות שבהן היא ריקה">🔄 חילוץ שמות</button>` : ""}
       <button class="btn" id="btn-rename">שינוי שם</button>
       ${mc ? `<button class="btn" id="btn-view-matrix">▦ תצוגת מטריצה</button>` : ""}
+      ${(() => { const n = topicOf(ds)?.kind === "bank" ? findSwappedDates(ds, state.rows).length : 0; return n ? `<button class="btn danger" id="btn-fix-dates">🛠 תיקון ${n} תאריכים הפוכים</button>` : ""; })()}
       ${isAdmin ? `<button class="btn danger" id="btn-del-ds">מחיקת טבלה</button>` : ""}
     </div>
     <p class="muted">${rows.length === state.rows.length ? `${rows.length} שורות` : `${rows.length} מתוך ${state.rows.length} שורות`} · לחיצה על תא לעריכה · לחיצה על כותרת למיון · מספר שורה בירוק = נוספה באתר</p>
@@ -826,6 +827,55 @@ function renderTables() {
       <td><button class="row-del" data-del="${r.id}" title="מחיקת שורה">🗑</button></td></tr>`).join("")}</tbody></table></div>
     ${rows.length > state.shown ? `<button class="btn more" id="btn-more">הצגת עוד ${Math.min(SHOW, rows.length - state.shown)}</button>` : ""}`;
   if (state.editing) startEdit(state.editing.row, state.editing.col);
+}
+
+// ---------------- repair dates stored with day/month swapped (bank XLS files read month-first before the fix) ----------------
+// A bank file lists its rows in posting order, so each date must fit between its neighbours. A date whose day is <= 12
+// could be swapped: if its swapped form fits between the nearest certain dates (day > 12) and the stored form doesn't, swap it.
+const swapDM = (v) => { const m = typeof v === "string" && v.match(/^(\d{4})-(\d\d)-(\d\d)(.*)$/); return m && +m[3] <= 12 && m[2] !== m[3] ? `${m[1]}-${m[3]}-${m[2]}${m[4]}` : null; };
+const tOf = (v) => new Date(String(v).slice(0, 10)).getTime();
+function findSwappedDates(ds, rows) {
+  const dateCols = ds.columns.filter((c) => c.type === "date");
+  const main = dateCols[0];
+  if (!main || rows.length < 3) return [];
+  const pts = [...rows].filter((r) => r.data[main.key]).sort((a, b) => a.id - b.id);
+  if (String(pts[0].data[main.key]) > String(pts[pts.length - 1].data[main.key])) pts.reverse(); // oldest first
+  const sure = (r) => !swapDM(r.data[main.key]);
+  const WEEK = 7 * 864e5, fixes = [];
+  for (let i = 0; i < pts.length; i++) {
+    const v = pts[i].data[main.key], alt = swapDM(v);
+    if (!alt) continue;
+    let p = i - 1; while (p >= 0 && !sure(pts[p])) p--;
+    let n = i + 1; while (n < pts.length && !sure(pts[n])) n++;
+    const lo = p >= 0 ? tOf(pts[p].data[main.key]) - WEEK : -Infinity, hi = n < pts.length ? tOf(pts[n].data[main.key]) + WEEK : Infinity;
+    const fits = (x) => tOf(x) >= lo && tOf(x) <= hi;
+    // distance to the nearest certain date (matters at the start/end of the file, where one side is open)
+    const anchors = [p >= 0 && pts[p].data[main.key], n < pts.length && pts[n].data[main.key]].filter(Boolean).map(tOf);
+    const dist = (x) => Math.min(...anchors.map((a) => Math.abs(tOf(x) - a)));
+    if (fits(alt) && (!fits(v) || (anchors.length && dist(alt) < dist(v)))) fixes.push(pts[i]);
+  }
+  // the fixed rows get their main date swapped; any other date column (value date) is swapped when that brings it near the main date
+  return fixes.map((r) => {
+    const data = { ...r.data, [main.key]: swapDM(r.data[main.key]) };
+    for (const c of dateCols.slice(1)) {
+      const v = data[c.key], alt = swapDM(v);
+      if (alt && Math.abs(tOf(alt) - tOf(data[main.key])) < Math.abs(tOf(v) - tOf(data[main.key])) && Math.abs(tOf(alt) - tOf(data[main.key])) <= 31 * 864e5) data[c.key] = alt;
+    }
+    return { row: r, data };
+  });
+}
+async function fixSwappedDates(ds) {
+  const rows = await loadRows(ds.id);
+  const fixes = findSwappedDates(ds, rows);
+  for (let i = 0; i < fixes.length; i += 10) {
+    await Promise.all(fixes.slice(i, i + 10).map(async ({ row, data }) => {
+      const { error } = await sb.from("dataset_rows").update({ data }).eq("id", row.id);
+      if (error) throw error;
+      row.data = data;
+      const local = state.rows?.find((x) => x.id === row.id); if (local) local.data = data;
+    }));
+  }
+  return fixes.length;
 }
 
 // ---------------- matrix view (category / month / type / amount tables, e.g. Cash Flow Outflow Uptoday) ----------------
@@ -988,6 +1038,7 @@ $("view-tables").addEventListener("click", async (e) => {
   if (t.closest("#btn-view-rows")) { state.view = "rows"; return render(); }
   if (t.closest("#btn-view-matrix")) { state.view = "matrix"; return render(); }
   if (t.closest("#btn-m-xlsx")) return matrixToExcel();
+  if (t.closest("#btn-fix-dates")) { t.closest("#btn-fix-dates").disabled = true; const n = await fixSwappedDates(state.ds).catch((err) => { console.error(err); return -1; }); toast(n < 0 ? "התיקון נכשל" : `תוקנו ${n} שורות`); return render(); }
   const tp = t.closest("[data-topic]"); if (tp) return openUpload(TOPICS.find((x) => x.id === tp.dataset.topic));
   if (t.closest("#btn-dl-all")) return downloadAll();
   const card = t.closest("[data-open]"); if (card) return openDataset(+card.dataset.open);

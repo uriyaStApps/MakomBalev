@@ -46,10 +46,12 @@ async function loadCategoryInfo() {
 function balanceTimeline(rows, dateCol, balCol, debit, credit) {
   const pts = rows.filter((r) => typeof r.data[balCol.key] === "number" && r.data[dateCol.key]);
   if (!pts.length) return null;
-  // keep the bank's posting order (the balance runs in that order, even where a date is out of order);
-  // Leumi lists the newest first, so reverse it
+  // by date; rows of the same day keep the bank's posting order (Leumi lists the newest first).
+  // Sorting by date means one misdated row can only affect its own month, never every month after it.
   pts.sort((a, b) => a.id - b.id);
   if (String(pts[0].data[dateCol.key]) > String(pts[pts.length - 1].data[dateCol.key])) pts.reverse();
+  const pos = new Map(pts.map((r, i) => [r, i]));
+  pts.sort((a, b) => String(a.data[dateCol.key]).slice(0, 10).localeCompare(String(b.data[dateCol.key]).slice(0, 10)) || pos.get(a) - pos.get(b));
   return pts.map((r) => {
     const close = r.data[balCol.key];
     const open = close - (Number(credit && r.data[credit.key]) || 0) + (Number(debit && r.data[debit.key]) || 0);
@@ -106,7 +108,8 @@ async function loadFacts(r) {
     }
   }
   const tl = dateCol && balCol ? balanceTimeline(rows, dateCol, balCol, debit, credit) : null;
-  return { facts, cats, tl, hasNames: !!nameCol, rows: rows.length };
+  const swapped = balCol ? findSwappedDates(ds, rows).length : 0; // dates stored with day/month swapped (old XLS reads)
+  return { facts, cats, tl, hasNames: !!nameCol, rows: rows.length, swapped, ds };
 }
 
 // facts for one year -> matrix
@@ -206,6 +209,8 @@ async function renderReports() {
       ${f.hasNames ? `<button class="btn" id="rep-expand">${rep.open.size ? "Collapse all" : "Expand all"}</button>` : ""}
       <button class="btn" id="rep-xlsx">⬇ Excel</button>
     </div>
+    ${f.swapped ? `<div class="blocked">⚠ בטבלה ${esc(f.ds.name)} יש <b>${f.swapped}</b> שורות שהתאריך שלהן נשמר הפוך (יום וחודש התחלפו, מטעינה ישנה), ולכן היתרות לפי חודש לא נכונות.
+      <button class="btn primary" id="rep-fix-dates">🛠 תיקון התאריכים</button></div>` : ""}
     ${M.mismatch.length ? `<p class="warn">⚠ בחודשים ${M.mismatch.map((x) => `${MONTHS[x.i]} (הפרש ${money(x.diff)})`).join(", ")} התנועות בטבלה לא מסתכמות ליתרה של הבנק. ייתכן שיש שורות כפולות או חסרות (למשל קובץ שנטען פעמיים עם "הוספה בלבד"). היתרות בדוח לקוחות מהבנק עצמו.</p>` : ""}
     ${uncats ? `<p class="warn">⚠ ${money(uncats)} ₪ בשנה הזאת בלי Category (שורת Uncategorized). אפשר לסווג אותן בטבלה ${esc(r.table)}.</p>` : ""}
     <div class="report-grid" dir="ltr">
@@ -270,6 +275,12 @@ $("view-reports").addEventListener("click", (e) => {
     return renderReports();
   }
   if (e.target.closest("#rep-xlsx")) return reportToExcel();
+  const fix = e.target.closest("#rep-fix-dates");
+  if (fix) {
+    const f = rep.cache[rep.id];
+    fix.disabled = true;
+    return fixSwappedDates(f.ds).then((n) => { toast(`תוקנו ${n} שורות`); rep.cache = {}; renderReports(); });
+  }
 });
 $("view-reports").addEventListener("change", (e) => {
   if (e.target.id === "rep-year") { rep.year = e.target.value; return renderReports(); }
