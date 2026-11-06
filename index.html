@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>MakomBalev</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="app.css?v=1">
+</head>
+<body>
+  <header class="top">
+    <h1>MakomBalev</h1>
+    <div id="who" class="who"></div>
+  </header>
+
+  <nav class="tabs" hidden>
+    <button class="tab active" data-tab="tables">טבלאות</button>
+    <button class="tab" data-tab="users" hidden>משתמשים</button>
+  </nav>
+
+  <main>
+    <p id="status" class="status">טוען…</p>
+
+    <section id="login" class="card login" hidden>
+      <h2>כניסה</h2>
+      <p>הכניסה לאתר באמצעות חשבון Gmail שאושר על ידי מנהל.</p>
+      <button id="google" class="btn primary" type="button">התחברות עם Google</button>
+      <div id="noaccess" class="notice" hidden></div>
+    </section>
+
+    <section id="view-tables" hidden></section>
+    <section id="view-users" hidden></section>
+  </main>
+
+  <dialog id="upload-dlg" class="dlg">
+    <form method="dialog" id="upload-form">
+      <h3>העלאת קובץ אקסל</h3>
+      <input type="file" id="upload-file" accept=".xlsx,.xls,.csv">
+      <div id="upload-sheets"></div>
+      <div class="dlg-actions">
+        <button type="button" class="btn primary" id="upload-go" disabled>טעינה</button>
+        <button type="button" class="btn" id="upload-cancel">ביטול</button>
+      </div>
+      <p id="upload-progress" class="muted"></p>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="app.js?v=1"></script>
+</body>
+</html>
