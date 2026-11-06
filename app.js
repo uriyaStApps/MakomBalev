@@ -9,7 +9,10 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
 
 // one upload button per subject; each subject loads into its own table
 const TOPICS = [
-  { id: "cashflow", label: "טעינת cash flow", table: "Cash Flow", derive: deriveCashFlow },
+  { id: "cashflow", label: "טעינת תנועות בנק", table: "Cash Flow", derive: deriveCashFlow, kind: "bank" },
+  // the bank shows one total charge per card; the card files hold the details -> separate tables, never mixed into Cash Flow
+  { id: "visa", label: "טעינת לאומי ויזה", table: "לאומי ויזה", derive: deriveCashFlow, kind: "card" },
+  { id: "mastercard", label: "טעינת ל.מאסטרקארד", table: "ל.מאסטרקארד", derive: deriveCashFlow, kind: "card" },
   { id: "outflow", label: "טעינת cash flow outflow uptoday", table: "Cash Flow Outflow Uptoday", derive: deriveCashFlow },
 ];
 // The Categories table is not uploaded: the site creates it once with this list, then it's edited on the site
@@ -24,6 +27,58 @@ const DEFAULT_CATEGORIES = [
   ["Bank", "Outflows"], ["bookkeeping", "Outflows"], ["Development and Marketing Webside", "Outflows"], ["Lawer", "Outflows"],
   ["Media", "Outflows"], ["Project Yuval", "Outflows"], ["Kredit Card Visa", "Outflows"], ["Kredit Card Mastercard", "Outflows"],
 ];
+// ---------------- accounts: the bank account + the 2 credit cards, each with the number its files must carry ----------------
+// Kept in a small "Accounts" table (editable on the site). The number is learned on the first confirmed upload.
+const ACCOUNTS_TABLE = "Accounts";
+const ACCOUNT_COLS = [{ key: "c1", label: "table", type: "text" }, { key: "c2", label: "name", type: "text" }, { key: "c3", label: "number", type: "text" }];
+async function ensureAccounts() {
+  if (state.datasets.some((d) => d.name === ACCOUNTS_TABLE)) return;
+  const { data, error } = await sb.from("datasets").insert({ name: ACCOUNTS_TABLE, columns: ACCOUNT_COLS, source_file: null }).select().single();
+  if (error) { if (error.code !== "23505") console.error(error); return; }
+  const rows = TOPICS.filter((tp) => tp.kind).map((tp) => ({ c1: tp.table, c2: tp.kind === "bank" ? "חשבון בנק לאומי" : tp.table }));
+  const { error: e2 } = await sb.from("dataset_rows").insert(rows.map((d) => ({ dataset_id: data.id, data: d, origin: "site" })));
+  if (e2) console.error(e2);
+  await loadDatasets();
+}
+async function loadAccounts() {
+  const ds = state.datasets.find((d) => d.name === ACCOUNTS_TABLE);
+  state.accounts = ds ? (await loadRows(ds.id)).map((r) => ({ id: r.id, data: r.data, table: r.data.c1, name: r.data.c2, number: r.data.c3 == null ? "" : String(r.data.c3) })) : [];
+  return state.accounts;
+}
+const accountOf = (topic) => state.accounts?.find((a) => a.table === topic.table) || { table: topic.table, name: topic.table, number: "" };
+async function saveAccountNumber(acc, number) {
+  if (!acc.id) return;
+  const data = { ...acc.data, c3: number };
+  const { error } = await sb.from("dataset_rows").update({ data }).eq("id", acc.id);
+  if (!error) { acc.data = data; acc.number = number; }
+}
+const digits = (s) => String(s ?? "").replace(/\D/g, "");
+// the account / card number written in a file (header lines, columns, details)
+function detectNumber(t, kind) {
+  if (kind === "bank") {
+    const br = t.columns.find((c) => /סניף|branch/i.test(c.label)), ac = t.columns.find((c) => /^\s*(מספר\s*)?חשבון\s*$|account/i.test(c.label));
+    if (ac) {
+      const count = {};
+      for (const r of t.rows) { const v = r[ac.key]; if (v == null) continue; const k = (br && r[br.key] != null ? r[br.key] + "-" : "") + v; count[k] = (count[k] || 0) + 1; }
+      const top = Object.entries(count).sort((a, b) => b[1] - a[1])[0];
+      if (top) return top[0];
+    }
+    const m = t.skipped.join(" ").match(/(\d{2,3}[-\s]\d{4,}(?:\/\d{2})?)/);
+    return m ? m[1].replace(/\s/, "-") : null;
+  }
+  // card: "המסתיים ב-1234", "כרטיס 1234", "****1234", or a column of last-4 digits
+  const text = [...t.skipped, ...t.columns.map((c) => c.label)].join(" ");
+  const m = text.match(/(?:המסתיים\s*ב-?|מסתיים\s*ב-?|כרטיס[^\d]{0,20}|card[^\d]{0,20}|\*{2,})(\d{4})(?!\d)/i);
+  if (m) return m[1];
+  const col = t.columns.find((c) => /4 ספרות|ספרות אחרונות|מספר כרטיס|last 4|card/i.test(c.label));
+  if (col) {
+    const v = t.rows.map((r) => digits(r[col.key]).slice(-4)).filter((x) => x.length === 4);
+    if (v.length) return v.sort((a, b) => v.filter((x) => x === b).length - v.filter((x) => x === a).length)[0];
+  }
+  return null;
+}
+const sameNumber = (kind, a, b) => kind === "card" ? digits(a).slice(-4) === digits(b).slice(-4) : digits(a) === digits(b);
+const numberLabel = (kind, n) => (kind === "card" ? `כרטיס המסתיים ב-${digits(n).slice(-4)}` : `חשבון ${n}`);
 async function ensureCategories() {
   const existing = state.datasets.find((d) => d.name === CATEGORIES_TABLE);
   if (existing) { // loaded earlier from a file: just make "type" a dropdown
@@ -63,7 +118,12 @@ function extractName(s) {
   return null;
 }
 const NAME_LABEL = "שם";
+// a file's own category column: "category", "קטגוריה", "סיווג", or "outflows" (as in the expenses / recieve sheets)
+const CAT_RE = /category|קטגורי|סיווג|^\s*outflows?\s*$/i;
 function nameFromRow(row, columns) {
+  // card statements name the business in its own column
+  const biz = columns.find((c) => /בית\s*ה?עסק|merchant|שם העסק/i.test(c.label));
+  if (biz && typeof row[biz.key] === "string" && row[biz.key].trim()) return row[biz.key].trim();
   // look in "תיאור מורחב" first (where Leumi puts these details), then in any other text column
   const first = (c) => /תיאור מורחב/.test(c.label);
   const order = [...columns.filter(first), ...columns.filter((c) => !first(c))];
@@ -78,8 +138,9 @@ function nameFromRow(row, columns) {
 function deriveCashFlow(t) {
   if (!t.columns.length) return 0;
   // a file that already has its own category column (e.g. category / month / type / amount) keeps it as is
-  const own = t.columns.find((c) => /category|קטגורי|סיווג/i.test(c.label) && !c.manual && c.label !== CATEGORY_COL.label);
-  if (!own) {
+  const own = t.columns.find((c) => CAT_RE.test(c.label) && !c.manual && c.label !== CATEGORY_COL.label);
+  if (own) addPickers(t.columns);
+  else {
     const cat = t.columns.find((c) => c.label === CATEGORY_COL.label);
     if (!cat) t.columns.push({ key: nextKey(t.columns), ...CATEGORY_COL });
     else Object.assign(cat, CATEGORY_COL);
@@ -96,21 +157,50 @@ function deriveCashFlow(t) {
   return n;
 }
 const topicOf = (ds) => ds && TOPICS.find((tp) => tp.table === ds.name);
+// rows typed on the site (e.g. Cash Flow Outflow Uptoday): category = dropdown from Categories, type = Inflows/Outflows.
+// Returns true when a column changed.
+function addPickers(columns) {
+  let changed = false;
+  for (const c of columns) {
+    if (CAT_RE.test(c.label) && !c.manual && c.label !== CATEGORY_COL.label && !c.lookup) { c.lookup = CATEGORIES_TABLE; changed = true; }
+    if (/^\s*type\s*$/i.test(c.label) && !c.options) { c.options = CATEGORY_TYPES; changed = true; }
+  }
+  return changed;
+}
+async function ensurePickers(ds) { // tables loaded before the pickers existed
+  if (!topicOf(ds)?.derive) return;
+  const columns = ds.columns.map((c) => ({ ...c }));
+  if (!addPickers(columns)) return;
+  const { error } = await sb.from("datasets").update({ columns }).eq("id", ds.id);
+  if (!error) ds.columns = columns;
+}
 
 // ---------------- which file belongs where (blocks loading a file into the wrong subject) ----------------
 const hasCol = (t, re, type) => t.columns.some((c) => re.test(c.label) && (!type || c.type === type));
 const isBank = (t) => hasCol(t, /תאריך|date/i) && hasCol(t, /חובה|debit/i) && hasCol(t, /זכות|credit/i) && hasCol(t, /יתרה|balance/i);
+// credit card statement: dates + amounts (charge/transaction), no running bank balance and no debit/credit pair
+const isCard = (t) => !isBank(t) && t.columns.some((c) => c.type === "date") && hasCol(t, /סכום|חיוב|amount|charge/i)
+  && !hasCol(t, /^\s*month\s*$|חודש/i) && !hasCol(t, CAT_RE);
+const CARD_RULE = { test: isCard, need: "תאריך עסקה וסכום חיוב (קובץ פירוט עסקאות של כרטיס אשראי, בלי עמודת יתרה)" };
 const FILE_RULES = {
   cashflow: { test: isBank, need: "תאריך, בחובה, בזכות, יתרה בש\"ח (קובץ תנועות עו\"ש מהבנק)" },
+  visa: CARD_RULE,
+  mastercard: CARD_RULE,
   outflow: {
-    test: (t) => !isBank(t) && (hasCol(t, /month|חודש/i) || t.columns.some((c) => c.type === "date")) && hasCol(t, /amount|סכום|חובה|זכות|outflow|הוצא/i),
-    need: "חודש או תאריך, וסכום (למשל category / month / type / amountNIS)",
+    test: (t) => !isBank(t) && hasCol(t, CAT_RE) && (hasCol(t, /month|חודש/i) || t.columns.some((c) => c.type === "date")) && hasCol(t, /amount|סכום|חובה|זכות|outflow|הוצא/i),
+    need: "category, חודש או תאריך, וסכום (category / month / type / amountNIS)",
   },
 };
+const KIND_NAME = { bank: "תנועות חשבון בנק", card: "פירוט כרטיס אשראי" };
 const fitsOf = (t) => TOPICS.filter((tp) => FILE_RULES[tp.id]?.test(t)).map((tp) => tp.id); // run on the file as read, before derive
 // null = OK, otherwise why this file can't go into that subject's table
 function wrongPlace(t, topic) {
   if (!topic || !FILE_RULES[topic.id] || t.fits.includes(topic.id)) return null;
+  // bank file into a card, or a card file into the bank: say it in those words
+  if (topic.kind && t.kind && t.kind !== topic.kind) {
+    const other = TOPICS.find((tp) => tp.kind && tp.kind !== topic.kind);
+    return `זה קובץ של <b>${KIND_NAME[topic.kind === "card" ? "bank" : "card"]}</b>, ולא של ${KIND_NAME[topic.kind]}. טענו אותו בריבוע של ${esc(other.table)}${topic.kind === "bank" ? " או של הכרטיס השני" : ""}.`;
+  }
   const other = TOPICS.find((tp) => t.fits.includes(tp.id));
   if (other) return `הקובץ הזה נראה כמו קובץ של <b>${esc(other.table)}</b>, לא של ${esc(topic.table)}. השתמשו בכפתור "${esc(other.label)}".`;
   return `הקובץ לא מתאים ל-<b>${esc(topic.table)}</b>. צריך עמודות: ${esc(FILE_RULES[topic.id].need)}.<br>בקובץ יש: ${t.columns.map((c) => esc(c.label)).join(" · ") || "(אין עמודות)"}`;
@@ -167,8 +257,8 @@ function cellValue(v) { // Excel cell -> JSON value
     if (s === "") return null;
     // text from CSV files (bank exports): "1,234.56" -> number, "01/11/2026" -> date (day first, Israeli style)
     if (/^-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$/.test(s) && !/^-?0\d/.test(s)) return Number(s.replace(/,/g, ""));
-    const d = s.match(/^(\d{1,2})[./](\d{1,2})[./](\d{4})$/);
-    if (d && +d[2] >= 1 && +d[2] <= 12 && +d[1] >= 1 && +d[1] <= 31) return `${d[3]}-${pad(d[2])}-${pad(d[1])}`;
+    const d = s.match(/^(\d{1,2})([./-])(\d{1,2})\2(\d{4}|\d{2})$/); // 01/11/2026, 3.6.25, 10-02-2025 (day first)
+    if (d && +d[3] >= 1 && +d[3] <= 12 && +d[1] >= 1 && +d[1] <= 31) return `${d[4].length === 2 ? "20" + d[4] : d[4]}-${pad(d[3])}-${pad(d[1])}`;
     return s;
   }
   return v;
@@ -199,6 +289,8 @@ function parseInput(text, type) {
     const m = t.match(/^(\d{1,2})[./](\d{1,2})[./](\d{2,4})(?:\s+(\d{1,2}):(\d\d))?$/);
     if (m) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${pad(m[2])}-${pad(m[1])}` + (m[4] ? ` ${pad(m[4])}:${m[5]}` : "");
   }
+  // a plain number typed into a text column is stored as a number (so sums work); "050..." stays text
+  if (/^-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$/.test(t) && !/^-?0\d/.test(t)) return Number(t.replace(/,/g, ""));
   return t;
 }
 
@@ -210,7 +302,8 @@ function sheetToTable(ws) {
   const filled = aoa.map((r) => r.filter((v) => cellValue(v) !== null).length);
   const widest = Math.max(0, ...filled);
   if (!widest) return { columns: [], rows: [], skipped: [] };
-  const hi = filled.findIndex((n) => n >= Math.max(2, Math.ceil(widest * 0.6)));
+  const hi = filled.findIndex((n) => n >= Math.max(Math.min(2, widest), Math.ceil(widest * 0.6))); // a one-column list is fine too
+  if (hi < 0) return { columns: [], rows: [], skipped: [] };
   const skipped = aoa.slice(0, hi).map((r) => r.map(cellValue).filter((v) => v !== null).join(" ")).filter(Boolean);
   let header = aoa[hi].map((v) => (v === null || v === undefined ? null : String(v).trim() || null)); // headers stay text
   const body = aoa.slice(hi + 1).map((r) => r.map(cellValue)).filter((r) => r.some((v) => v !== null));
@@ -219,7 +312,11 @@ function sheetToTable(ws) {
   const lead = (r) => { const i = r.findIndex((v) => v !== null && v !== undefined); return i < 0 ? Infinity : i; };
   const shift = lead(header) - Math.min(...body.map(lead));
   if (body.length && shift > 0 && shift < Infinity) header = header.slice(shift);
-  const width = Math.max(header.length, ...body.map((r) => r.length));
+  let width = body.reduce((w, r) => Math.max(w, r.length), header.length);
+  // a summary block next to the data (e.g. a monthly matrix to the side) is not part of the table:
+  // the table ends at the first column that is completely empty (no title, no values)
+  const first = header.findIndex((v) => v != null);
+  for (let j = first + 1; j < width; j++) if (header[j] == null && body.every((r) => (r[j] ?? null) === null)) { width = j; break; }
   const columns = [], seen = {};
   for (let i = 0; i < width; i++) {
     if (header[i] == null && body.every((r) => (r[i] ?? null) === null)) continue; // empty column with no title
@@ -250,11 +347,15 @@ function mapToTable(ds, t) {
   for (const c of t.columns) {
     let hit = cols.find((x) => x.label === c.label);
     if (!hit) { hit = { ...c, key: nextKey(cols) }; cols.push(hit); }
-    else if (c.lookup) Object.assign(hit, { lookup: c.lookup, manual: c.manual });
+    else {
+      if (c.lookup) Object.assign(hit, { lookup: c.lookup, manual: c.manual });
+      if (c.options) hit.options = c.options;
+    }
     map[c.key] = hit.key;
   }
   const rows = t.rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [map[k], v])));
-  const fileDate = t.columns.find((c) => c.type === "date");
+  // card statements: the charge date is the same for the whole monthly file, so it marks the file's period exactly
+  const fileDate = t.columns.find((c) => c.type === "date" && /חיוב|charge|billing/i.test(c.label)) || t.columns.find((c) => c.type === "date");
   // the bank's own columns identify a row; used to carry hand-picked values over when a period is reloaded
   const sigKeys = t.columns.filter((c) => !c.manual && c.label !== NAME_LABEL).map((c) => map[c.key]);
   return { cols, rows, dateKey: fileDate ? map[fileDate.key] : null, sigKeys };
@@ -304,13 +405,15 @@ $("upload-file").addEventListener("change", async (e) => {
   if (!file) return;
   try {
     const wb = await readWorkbook(file);
-    upload = { file, topic: uploadTopic, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, sheetToTable(wb.Sheets[n])])) };
+    const safe = (n) => { try { return sheetToTable(wb.Sheets[n]); } catch (err) { console.error(n, err); return { columns: [], rows: [], skipped: [], broken: true }; } };
+    upload = { file, topic: uploadTopic, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, safe(n)])) };
   } catch (err) { console.error(err); toast("לא הצלחתי לקרוא את הקובץ"); return; }
-  Object.values(upload.tables).forEach((t) => { t.fits = fitsOf(t); });
-  if (upload.topic?.derive) Object.values(upload.tables).forEach((t) => { if (t.fits.includes(upload.topic.id)) upload.topic.derive(t); });
+  Object.values(upload.tables).forEach((t) => { t.fits = fitsOf(t); t.kind = isBank(t) ? "bank" : isCard(t) ? "card" : null; }); // before our own columns are added
+  // name + Category columns for any file that fits a subject with a derive rule (the account question may still change the subject)
+  if (upload.topic?.derive) Object.values(upload.tables).forEach((t) => { if (t.fits.some((id) => TOPICS.find((x) => x.id === id)?.derive)) deriveCashFlow(t); });
   const opts = state.datasets.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
   $("upload-sheets").innerHTML = Object.entries(upload.tables).map(([name, t]) => {
-    const dc = t.columns.find((c) => c.type === "date");
+    const dc = t.columns.find((c) => c.type === "date" && /חיוב|charge|billing/i.test(c.label)) || t.columns.find((c) => c.type === "date");
     const r = dc && dateRange(t.rows.map((x) => x[dc.key]));
     return `<div class="sheet-opt" data-sheet="${esc(name)}">
       <label><input type="checkbox" class="s-on" ${t.rows.length ? "checked" : ""}> <b>${esc(name)}</b> <span class="muted">${t.rows.length} שורות · ${t.columns.length} עמודות</span></label>
@@ -320,6 +423,7 @@ $("upload-file").addEventListener("change", async (e) => {
       ${lostHebrew(t) ? `<div class="warn">⚠ בקובץ מופיעים סימני שאלה במקום עברית. העברית כבר אבדה בקובץ עצמו (כנראה נשמר מחדש בתוכנה אחרת). כדאי להוריד אותו שוב מהבנק ולהעלות כמו שהוא, בלי לפתוח ולשמור.</div>` : ""}
       <label>לאן: <select class="s-target"><option value="new">טבלה חדשה</option>${opts}</select>
         <input type="text" class="s-name" value="${esc(name)}" placeholder="שם הטבלה"></label>
+      <div class="s-acc"></div>
       <div class="s-plan"></div>
     </div>`;
   }).join("");
@@ -329,27 +433,82 @@ $("upload-file").addEventListener("change", async (e) => {
   const squash = (s) => String(s).toLowerCase().replace(/[^a-z0-9֐-׿]/g, "");
   const fits = (n) => upload.tables[n].rows.length && upload.tables[n].fits.includes(topic.id);
   const named = (n) => squash(n).includes(squash(topic.table).slice(0, 6)); // "category" sheet for "Categories", "cashFlow" for the outflow table
-  const pick = topic && (sheetNames.find((n) => fits(n) && named(n)) || sheetNames.find(fits) || sheetNames.find((n) => upload.tables[n].rows.length));
+  // the sheet that probably fits: only a hint in the sheet question, never chosen for the user
+  const hint = topic ? (sheetNames.find((n) => fits(n) && named(n)) || sheetNames.find(fits)) : null;
+  const multi = sheetNames.length > 1;
   document.querySelectorAll(".sheet-opt").forEach((el, i) => {
     const t = upload.tables[el.dataset.sheet];
+    el.querySelector(".s-on").hidden = true; // one sheet per load: chosen in the question above
+    el.querySelector(".s-on").checked = !multi;
+    el.hidden = multi;
     if (topic) {
-      const on = el.dataset.sheet === pick;
-      el.querySelector(".s-on").checked = on;
       const guess = state.datasets.find((d) => d.name === topic.table) || guessTarget(el.dataset.sheet, t);
       el.querySelector(".s-target").value = guess ? guess.id : "new";
       el.querySelector(".s-name").value = topic.table;
       el.querySelector(".s-target").closest("label").hidden = true;
-      if (Object.keys(upload.tables).length === 1) el.querySelector(".s-on").closest("label").querySelector("input").hidden = true;
     } else {
       const guess = guessTarget(el.dataset.sheet, t);
       if (guess) el.querySelector(".s-target").value = guess.id;
     }
-    const sync = () => planSheet(el, i, t);
-    el.querySelector(".s-target").addEventListener("change", sync);
-    el.querySelector(".s-on").addEventListener("change", sync); sync();
+    el.sync = () => planSheet(el, i, t);
+    el.querySelector(".s-target").addEventListener("change", el.sync);
+    el.sync();
   });
+  // Uriya: every file with several sheets asks which sheet is meant
+  if (multi) {
+    $("upload-sheets").insertAdjacentHTML("afterbegin", `<label class="sheet-pick">באיזה גיליון (Sheet) מדובר?
+      <select id="upload-sheet"><option value="">— בחרו גיליון —</option>
+      ${sheetNames.map((n) => `<option value="${esc(n)}">${esc(n)} (${upload.tables[n].rows.length} שורות)${n === hint ? " ← מתאים לכפתור הזה" : ""}</option>`).join("")}</select></label>`);
+    $("upload-sheet").addEventListener("change", (e) => {
+      document.querySelectorAll(".sheet-opt").forEach((el) => {
+        const on = el.dataset.sheet === e.target.value;
+        el.hidden = !on; el.querySelector(".s-on").checked = on; el.sync();
+      });
+    });
+  }
+  // Uriya: every bank / card upload asks which account the file is: bank account Z, card X or card Y.
+  // The account whose number appears in the file is marked; the answer decides the table.
+  if (topic?.kind) {
+    upload.chosen = null;
+    const accTopics = TOPICS.filter((tp) => tp.kind);
+    const inFile = (tp) => { const a = accountOf(tp); return !!a.number && Object.values(upload.tables).some((t) => { const n = detectNumber(t, tp.kind); return n && sameNumber(tp.kind, a.number, n); }); };
+    const html = `<div class="sheet-pick acct-pick">לאיזה חשבון / כרטיס שייך הקובץ?
+      ${accTopics.map((tp) => { const a = accountOf(tp); return `<label class="opt"><input type="radio" name="upload-acct" value="${tp.id}">
+        <span>${tp.kind === "bank" ? "🏦" : "💳"} <b>${esc(a.name || tp.table)}</b> · ${a.number ? esc(numberLabel(tp.kind, a.number)) : `<span class="muted">מספר עוד לא ידוע</span>`}${inFile(tp) ? ` <b class="found">✓ זה המספר שבקובץ</b>` : ""}</span></label>`; }).join("")}</div>`;
+    const sheetQ = $("upload-sheet")?.closest("label");
+    if (sheetQ) sheetQ.insertAdjacentHTML("afterend", html); else $("upload-sheets").insertAdjacentHTML("afterbegin", html);
+    document.querySelectorAll('input[name="upload-acct"]').forEach((r) => r.addEventListener("change", () => {
+      const tp = TOPICS.find((x) => x.id === r.value);
+      upload.topic = upload.chosen = tp;
+      $("upload-title").textContent = tp.label;
+      const d = state.datasets.find((x) => x.name === tp.table);
+      document.querySelectorAll(".sheet-opt").forEach((el) => { el.querySelector(".s-target").value = d ? d.id : "new"; el.querySelector(".s-name").value = tp.table; el.sync(); });
+    }));
+    document.querySelectorAll(".sheet-opt").forEach((el) => el.sync());
+  }
   $("upload-go").disabled = false;
 });
+
+// Bank / card uploads: the number in the file must be the tile's number. Renders into .s-acc and returns
+// null (not an account table) | {blocked} | {acc, ok} | {acc, save: number} (first time: confirm, then remember) | {acc} (no number found: confirm)
+function verifyAccount(el, t) {
+  const box = el.querySelector(".s-acc");
+  const topic = upload.topic || topicOf(state.datasets.find((d) => d.id === +el.querySelector(".s-target").value));
+  if (!topic?.kind) { box.innerHTML = ""; return null; }
+  const kind = topic.kind, acc = accountOf(topic), name = esc(acc.name || topic.table);
+  const what = kind === "card" ? "כרטיס" : "חשבון";
+  const found = detectNumber(t, kind);
+  if (found) {
+    const owner = (state.accounts || []).find((a) => a.table !== topic.table && a.number && TOPICS.find((tp) => tp.table === a.table)?.kind === kind && sameNumber(kind, a.number, found));
+    if (owner) { box.innerHTML = `<div class="blocked">⛔ בקובץ מופיע ${numberLabel(kind, found)}, וזה המספר של <b>${esc(owner.name)}</b>, לא של ${name}. טענו אותו בריבוע של ${esc(owner.name)}. הטעינה חסומה.</div>`; return { blocked: true }; }
+    if (acc.number && sameNumber(kind, acc.number, found)) { box.innerHTML = `<div class="ok">✓ הקובץ שייך ל-${name} (${numberLabel(kind, found)})</div>`; return { acc, ok: true }; }
+    if (acc.number) { box.innerHTML = `<div class="blocked">⛔ בקובץ מופיע ${numberLabel(kind, found)}, אבל ${name} הוא ${numberLabel(kind, acc.number)}. כנראה זה קובץ של ${what} אחר. הטעינה חסומה.<br><span class="muted">אם המספר השתנה באמת, עדכנו אותו בטבלה ${ACCOUNTS_TABLE}.</span></div>`; return { blocked: true }; }
+    box.innerHTML = `<div class="ok">זוהה בקובץ <b>${numberLabel(kind, found)}</b>. המספר יישמר ל-${name}, ומעכשיו הבדיקה תהיה אוטומטית.</div>`;
+    return { acc, save: found };
+  }
+  box.innerHTML = `<div class="warn">לא מצאתי בקובץ מספר ${what}${acc.number ? ` (מצופה: ${numberLabel(kind, acc.number)})` : ""}. הקובץ ייטען ל-${name} לפי הבחירה שלכם.</div>`;
+  return { acc };
+}
 
 // Loading into a table that already has rows: compare date ranges and make the user choose what happens.
 async function planSheet(el, i, t) {
@@ -357,15 +516,20 @@ async function planSheet(el, i, t) {
   const box = el.querySelector(".s-plan");
   el.querySelector(".s-name").hidden = target !== "new";
   el.plan = null;
+  el.querySelector(".s-acc").innerHTML = "";
   if (!el.querySelector(".s-on").checked) { box.innerHTML = ""; el.plan = { skip: true }; return; } // only check sheets that will load
+  if (upload.topic?.kind && !upload.chosen) { box.innerHTML = `<div class="warn">בחרו למעלה לאיזה חשבון / כרטיס שייך הקובץ.</div>`; el.plan = { needAcct: true }; return; }
   const ds = target === "new" ? null : state.datasets.find((d) => d.id === +target);
   // wrong place? (a subject button, or a subject's table picked by hand)
   const why = wrongPlace(t, upload.topic || topicOf(ds));
   if (why) { box.innerHTML = `<div class="blocked">⛔ ${why}<br>הטעינה חסומה.</div>`; el.plan = { blocked: true }; return; }
+  // the bank account / card number in the file must be the one this tile is for
+  const acc = verifyAccount(el, t);
+  if (acc?.blocked) { box.innerHTML = ""; el.plan = { blocked: true }; return; }
   if (!ds) {
     const looks = TOPICS.find((tp) => t.fits.includes(tp.id));
     box.innerHTML = !upload.topic && looks ? `<div class="warn">נראה כמו קובץ של ${esc(looks.table)}. כדי שייכנס לטבלה הנכונה, עדיף להשתמש בכפתור "${esc(looks.label)}".</div>` : "";
-    el.plan = { mode: "new" };
+    el.plan = { mode: "new", acc };
     return;
   }
   const m = mapToTable(ds, t);
@@ -382,10 +546,12 @@ async function planSheet(el, i, t) {
   try { existing = await fetchAll(() => sb.from("dataset_rows").select(m.dateKey ? `id,d:data->>${m.dateKey}` : "id").eq("dataset_id", ds.id).order("id")); }
   catch (err) { console.error(err); box.innerHTML = `<span class="warn">לא הצלחתי לבדוק את הטבלה הקיימת</span>`; return; }
   if (el.querySelector(".s-target").value !== target) return; // changed while loading
-  const plan = { mode: null, ds, m, total: existing.length };
+  const plan = { mode: null, ds, m, total: existing.length, acc };
   el.plan = plan;
   if (!existing.length) { plan.mode = "append"; box.innerHTML = `<div class="muted">הטבלה "${esc(ds.name)}" ריקה, השורות ייטענו אליה.</div>`; return; }
 
+  // Uriya: card files come one month at a time and are a lot of work to reload -> never offer wiping a card table
+  const noWipe = (upload.topic || topicOf(ds))?.kind === "card";
   const fileR = m.dateKey && dateRange(m.rows.map((r) => r[m.dateKey]));
   const tableR = m.dateKey && dateRange(existing.map((r) => r.d));
   let info, periodOpt = "";
@@ -404,19 +570,22 @@ async function planSheet(el, i, t) {
     ${periodOpt}
     <label class="opt"><input type="radio" name="mode${i}" value="append">
       <span><b>הוספה בלבד</b>: כל ${m.rows.length} שורות הקובץ יתווספו, בלי למחוק כלום${plan.overlap ? `. <span class="warn">שורות בתקופה החופפת יופיעו פעמיים.</span>` : "."}</span></label>
-    <label class="opt danger-opt"><input type="radio" name="mode${i}" value="all">
-      <span><b>⚠ דריסת כל הטבלה</b>: מחיקת כל ${existing.length} השורות הקיימות (כולל מה שנוסף באתר) והשארת תוכן הקובץ בלבד. אין דרך חזרה.${m.cols.some((c) => c.manual) ? " (Category שנבחר ידנית יישמר רק לשורות שמופיעות שוב בקובץ.)" : ""}</span></label>
+    ${noWipe ? `<div class="muted">🔒 בטבלת כרטיס אשראי אין אפשרות לדרוס את כל הטבלה: כל קובץ הוא חודש אחד, ורק החודש שלו מתעדכן.</div>`
+      : `<label class="opt danger-opt"><input type="radio" name="mode${i}" value="all">
+      <span><b>⚠ דריסת כל הטבלה</b>: מחיקת כל ${existing.length} השורות הקיימות (כולל מה שנוסף באתר) והשארת תוכן הקובץ בלבד. אין דרך חזרה.${m.cols.some((c) => c.manual) ? " (Category שנבחר ידנית יישמר רק לשורות שמופיעות שוב בקובץ.)" : ""}</span></label>`}
   </div>`;
   box.querySelectorAll("input[type=radio]").forEach((r) => r.addEventListener("change", () => { plan.mode = r.value; }));
 }
 
 $("upload-go").addEventListener("click", async () => {
   const jobs = [...document.querySelectorAll(".sheet-opt")].filter((el) => el.querySelector(".s-on").checked);
-  if (!jobs.length) return toast("לא נבחר אף גיליון");
+  if (!jobs.length) { $("upload-sheet")?.focus(); return toast("צריך לבחור באיזה גיליון (Sheet) מדובר"); }
   for (const el of jobs) {
     if (!el.plan) return toast("רגע, עדיין בודק את הטבלה הקיימת");
+    if (el.plan.needAcct) { document.querySelector('input[name="upload-acct"]')?.focus(); return toast("צריך לבחור לאיזה חשבון / כרטיס שייך הקובץ", 4000); }
     if (el.plan.blocked) { el.scrollIntoView({ block: "center" }); return toast("הקובץ לא מתאים לטבלה הזאת, הטעינה חסומה", 4000); }
     if (!el.plan.mode) { el.scrollIntoView({ block: "center" }); return toast(`צריך לבחור מה לעשות עם הנתונים הקיימים בטבלה "${el.plan.ds.name}"`, 4000); }
+    if (el.plan.mode === "all" && topicOf(el.plan.ds)?.kind === "card") return toast("בטבלת כרטיס אשראי אי אפשר לדרוס את כל הטבלה", 4000);
     if (el.plan.mode === "all" && !confirm(`⚠ למחוק את כל ${el.plan.total} השורות בטבלה "${el.plan.ds.name}" ולהשאיר רק את תוכן הקובץ? אין דרך חזרה.`)) return;
   }
   $("upload-go").disabled = true;
@@ -430,6 +599,7 @@ $("upload-go").addEventListener("click", async () => {
         const { data, error } = await sb.from("datasets").insert({ name, columns: t.columns, source_file: upload.file.name }).select().single();
         if (error) throw error.code === "23505" ? new Error(`כבר קיימת טבלה בשם "${name}"`) : error;
         await insertRows(data.id, t.rows, "excel");
+        if (plan.acc?.save) await saveAccountNumber(plan.acc.acc, plan.acc.save);
         lastId = data.id;
         continue;
       }
@@ -452,6 +622,7 @@ $("upload-go").addEventListener("click", async () => {
       const { error } = await sb.from("datasets").update(patch).eq("id", ds.id);
       if (error) throw error;
       await insertRows(ds.id, m.rows, "excel");
+      if (plan.acc?.save) await saveAccountNumber(plan.acc.acc, plan.acc.save);
       lastId = ds.id;
     }
     sb.from("usage_logs").insert({ visitor_name: user.email, action: `upload:${upload.file.name}` }).then(() => {});
@@ -508,6 +679,7 @@ async function openDataset(id) {
   $("status").textContent = "טוען…";
   try {
     state.rows = await loadRows(id);
+    await ensurePickers(state.ds);
     await loadLookups(state.ds);
     $("status").textContent = "";
   }
@@ -546,10 +718,20 @@ function renderTables() {
   const el = $("view-tables");
   if (!state.ds) {
     el.innerHTML = `<div class="toolbar"><h2>טבלאות</h2>
-      ${TOPICS.map((tp) => `<button class="btn primary" data-topic="${tp.id}">⬆ ${esc(tp.label)}</button>`).join("")}
+      ${TOPICS.filter((tp) => !tp.kind).map((tp) => `<button class="btn primary" data-topic="${tp.id}">⬆ ${esc(tp.label)}</button>`).join("")}
       <button class="btn" id="btn-upload">⬆ טעינת קובץ אחר</button>
       ${state.datasets.length ? `<button class="btn" id="btn-dl-all">⬇ הורדת הכול לאקסל</button>` : ""}</div>
-      ${state.datasets.length ? `<div class="grid-cards">${state.datasets.map((d) => `
+      <div class="acct-tiles">${TOPICS.filter((tp) => tp.kind).map((tp) => {
+        const acc = accountOf(tp), d = state.datasets.find((x) => x.name === tp.table);
+        return `<div class="card acct k-${tp.kind}">
+          <div class="acct-kind">${tp.kind === "bank" ? "🏦 תנועות בנק" : "💳 כרטיס אשראי"}</div>
+          <h3>${esc(acc.name || tp.table)}</h3>
+          <div class="acct-num">${acc.number ? esc(numberLabel(tp.kind, acc.number)) : `<span class="muted">המספר יזוהה בטעינה הבאה</span>`}</div>
+          <div class="muted">${d ? `${state.counts[d.id] ?? 0} שורות · עודכן ${fmtDate(d.updated_at)}` : "עדיין לא נטען"}</div>
+          <div class="acct-btns"><button class="btn primary" data-topic="${tp.id}">⬆ טעינה</button>${d ? `<button class="btn" data-open="${d.id}">פתיחת הטבלה</button>` : ""}</div>
+        </div>`;
+      }).join("")}</div>
+      ${state.datasets.length ? `<div class="grid-cards">${state.datasets.filter((d) => !TOPICS.some((tp) => tp.kind && tp.table === d.name)).map((d) => `
         <div class="card ds-card" data-open="${d.id}"><h3>${esc(d.name)}</h3>
         <div class="muted">${state.counts[d.id] ?? 0} שורות · ${d.columns.length} עמודות</div>
         <div class="muted">עודכן ${fmtDate(d.updated_at)}${d.source_file ? ` · מקור: ${esc(d.source_file)}` : ""}</div></div>`).join("")}</div>`
@@ -824,6 +1006,8 @@ async function start() {
   try {
     await Promise.all([loadDatasets(), isAdmin ? loadUsers() : null]);
     await ensureCategories();
+    await ensureAccounts();
+    await loadAccounts();
     $("status").textContent = "";
     render();
     sb.from("usage_logs").insert({ visitor_name: user.email, action: "page_view" }).then(() => {});

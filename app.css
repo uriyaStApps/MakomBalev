@@ -62,6 +62,22 @@ table.data td input { width: 100%; min-width: 120px; font: inherit; padding: 3px
 .sheet-opt label { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .blocked { padding: 10px; border: 2px solid #d32f2f; border-radius: 8px; background: #fdecec; color: #b71c1c; font-size: 14px; }
 @media (prefers-color-scheme: dark) { .blocked { background: #3a1c1c; color: #ff8a80; border-color: #ff8a80; } }
+.sheet-pick { display: grid; gap: 6px; margin-top: 12px; font-weight: 500; }
+.sheet-pick select { width: 100%; }
+.acct-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.acct { border-top: 4px solid var(--accent); }
+.acct.k-card { border-top-color: #1565c0; }
+.acct.k-bank { border-top-color: #2e7d32; }
+.acct h3 { margin: 4px 0; font-size: 18px; }
+.acct-kind { font-size: 13px; color: var(--muted); }
+.acct-num { font-weight: 500; direction: rtl; }
+.acct-btns { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.acct-pick { gap: 6px; }
+.acct-pick .found { color: #2e7d32; }
+.ok { padding: 8px 10px; border-radius: 8px; background: #e8f5e9; color: #1b5e20; border: 1px solid #66bb6a; }
+.confirm { display: flex !important; gap: 8px; align-items: flex-start !important; padding: 8px 10px; border-radius: 8px; border: 2px solid #1565c0; background: var(--card); cursor: pointer; }
+.confirm.warnbox { border-color: var(--warn); }
+@media (prefers-color-scheme: dark) { .ok { background: #1b3a1f; color: #a5d6a7; } }
 .plan-box { display: grid; gap: 8px; padding: 10px; border-radius: 8px; background: var(--soft); }
 .sheet-opt label.opt { display: flex; gap: 8px; align-items: flex-start; flex-wrap: nowrap; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); cursor: pointer; }
 .opt input { margin-top: 4px; }

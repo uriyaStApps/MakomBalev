@@ -78,7 +78,7 @@ async function loadFacts(r) {
   if (!ds) return { error: `הטבלה "${r.table}" עדיין לא נטענה. טענו אותה מלשונית הטבלאות.` };
   const [rows, cats] = await Promise.all([loadRows(ds.id), loadCategoryInfo()]);
   const cols = ds.columns;
-  const catCol = cols.find((c) => c.label === CATEGORY_COL.label && c.manual) || cols.find((c) => /category|קטגורי|סיווג/i.test(c.label));
+  const catCol = cols.find((c) => c.label === CATEGORY_COL.label && c.manual) || cols.find((c) => CAT_RE.test(c.label));
   const monthCol = cols.find((c) => /^\s*month\s*$|חודש/i.test(c.label));
   const amountCol = cols.find((c) => /amount|סכום/i.test(c.label));
   const typeCol = cols.find((c) => /^\s*type\s*$|סוג/i.test(c.label));
