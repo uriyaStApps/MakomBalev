@@ -15,7 +15,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 Heebo
 .tabs { display: flex; gap: 4px; padding: 8px 16px 0; background: var(--card); border-bottom: 1px solid var(--line); }
 .tab { border: 0; background: none; padding: 8px 14px; font: inherit; color: var(--muted); cursor: pointer; border-bottom: 3px solid transparent; }
 .tab.active { color: var(--ink); border-color: var(--accent); font-weight: 500; }
-main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+main { padding: 16px; }
 .status { color: var(--muted); }
 .status:empty { display: none; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }

@@ -46,20 +46,30 @@ async function loadCategoryInfo() {
 function balanceTimeline(rows, dateCol, balCol, debit, credit) {
   const pts = rows.filter((r) => typeof r.data[balCol.key] === "number" && r.data[dateCol.key]);
   if (!pts.length) return null;
-  const desc = String(pts[0].data[dateCol.key]) > String(pts[pts.length - 1].data[dateCol.key]);
-  pts.sort((a, b) => String(a.data[dateCol.key]).slice(0, 10).localeCompare(String(b.data[dateCol.key]).slice(0, 10)) || (desc ? b.id - a.id : a.id - b.id));
+  // keep the bank's posting order (the balance runs in that order, even where a date is out of order);
+  // Leumi lists the newest first, so reverse it
+  pts.sort((a, b) => a.id - b.id);
+  if (String(pts[0].data[dateCol.key]) > String(pts[pts.length - 1].data[dateCol.key])) pts.reverse();
   return pts.map((r) => {
     const close = r.data[balCol.key];
     const open = close - (Number(credit && r.data[credit.key]) || 0) + (Number(debit && r.data[debit.key]) || 0);
     return { day: String(r.data[dateCol.key]).slice(0, 10), open, close };
   });
 }
-// balance at the start of a month (null when the bank data doesn't reach it)
+// the bank's own balance at the start / end of a month (null when the bank data doesn't cover that month)
+const tlRange = (tl) => tl.range || (tl.range = tl.reduce((r, p) => [p.day < r[0] ? p.day : r[0], p.day > r[1] ? p.day : r[1]], [tl[0].day, tl[0].day]));
+const covers = (tl, ym) => !!tl && tlRange(tl)[0].slice(0, 7) <= ym && tlRange(tl)[1].slice(0, 7) >= ym;
+const prevYM = (ym) => { const [y, m] = ym.split("-").map(Number); return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, "0")}`; };
+// balance after the last posting dated in (or before) this month
+function closingAt(tl, ym) {
+  if (!covers(tl, ym)) return null;
+  for (let j = tl.length - 1; j >= 0; j--) if (tl[j].day <= `${ym}-99`) return tl[j].close;
+  return null;
+}
+// = last month's closing, so the two rows always agree; the very first month starts from its first posting
 function openingAt(tl, ym) {
-  if (!tl) return null;
-  const first = tl.find((p) => p.day >= `${ym}-01`);
-  if (first) return first.day.slice(0, 7) === ym || tl[0].day < `${ym}-01` ? first.open : null;
-  return tl[tl.length - 1].close;
+  if (!covers(tl, ym)) return null;
+  return closingAt(tl, prevYM(ym)) ?? tl.find((p) => p.day >= `${ym}-01`)?.open ?? null;
 }
 
 // table -> facts [{ym, cat, type, amt, name}] + optional balance timeline
@@ -100,7 +110,7 @@ async function loadFacts(r) {
 }
 
 // facts for one year -> matrix
-function buildMatrix(f, year, opening0) {
+function buildMatrix(f, year, opening0, tl) {
   const yms = MONTHS.map((_, i) => `${year}-${String(i + 1).padStart(2, "0")}`);
   const sec = { in: new Map(), out: new Map() };
   const blank = () => Array(12).fill(0);
@@ -118,8 +128,19 @@ function buildMatrix(f, year, opening0) {
   const tin = sumCols(ins), tout = sumCols(outs), net = tin.map((v, i) => v - tout[i]);
   const has = yms.map((ym) => f.facts.some((x) => x.ym === ym));
   const last = has.lastIndexOf(true);
-  const open = Array(12).fill(null), close = Array(12).fill(null);
-  if (opening0 != null) for (let i = 0, o = opening0; i <= last; i++) { open[i] = o; close[i] = o + net[i]; o = close[i]; }
+  // opening / ending balance: the bank's real balance wherever the bank data covers the month,
+  // otherwise carried forward from the previous month + this month's net (projection months)
+  const open = Array(12).fill(null), close = Array(12).fill(null), mismatch = [];
+  const lastBal = Math.max(last, ...yms.map((ym, i) => (covers(tl, ym) ? i : -1)));
+  for (let i = 0; i <= lastBal; i++) {
+    const bo = openingAt(tl, yms[i]), bc = closingAt(tl, yms[i]);
+    open[i] = i === 0 && opening0 != null ? opening0 : bo ?? (i > 0 ? close[i - 1] : opening0);
+    if (open[i] == null) continue;
+    close[i] = bc ?? open[i] + net[i];
+    if (f.tl && bo != null && bc != null && Math.abs(bo + net[i] - bc) > 0.5) mismatch.push({ i, diff: bc - (bo + net[i]) });
+  }
+  // a posting dated in one month but booked in the next shows as +x / -x in two months: that's timing, not missing rows
+  if (Math.abs(mismatch.reduce((s, x) => s + x.diff, 0)) <= 0.5) mismatch.length = 0;
   const active = has.filter(Boolean).length || 1;
   const yearOf = (m) => m.reduce((s, v) => s + v, 0);
   // R:X annual panel
@@ -133,15 +154,14 @@ function buildMatrix(f, year, opening0) {
       return sum + (hit ? byNorm.get(hit) * share : 0);
     }, 0),
   }));
-  return { yms, ins, outs, tin, tout, net, open, close, has, last, yearOf,
+  return { yms, ins, outs, tin, tout, net, open, close, has, last, yearOf, mismatch,
     annual: { avgIn: yearOf(tin) / active, avgOut: yearOf(tout) / active, months: has.filter(Boolean).length, sections } };
 }
 
 function openingFor(r, f, year) {
   try { const v = localStorage.getItem(`mb_open_${r.id}_${year}`); if (v !== null && v !== "") return { value: Number(v), manual: true }; } catch {}
   const tl = f.tl || rep.cache.cashflow?.tl; // the outflow sheet has no balance: take it from the bank (Cash Flow table)
-  const v = openingAt(tl, `${year}-01`) ?? openingAt(tl, f.facts.map((x) => x.ym).filter((ym) => ym.startsWith(year)).sort()[0]);
-  return { value: v, manual: false };
+  return { value: openingAt(tl, `${year}-01`), manual: false };
 }
 
 async function renderReports() {
@@ -162,7 +182,7 @@ async function renderReports() {
   if (!years.length) { el.innerHTML = head + `<div class="card empty">אין בטבלה נתונים עם תאריך/חודש וסכום.</div>`; return; }
   if (!years.includes(rep.year)) rep.year = years[years.length - 1];
   const op = openingFor(r, f, rep.year);
-  const M = buildMatrix(f, rep.year, op.value);
+  const M = buildMatrix(f, rep.year, op.manual ? op.value : null, f.tl || rep.cache.cashflow?.tl);
   rep.last = { r, M, f };
   const uncats = [...M.ins, ...M.outs].filter((c) => c.cat === UNCAT).reduce((s, c) => s + M.yearOf(c.m), 0);
 
@@ -186,6 +206,7 @@ async function renderReports() {
       ${f.hasNames ? `<button class="btn" id="rep-expand">${rep.open.size ? "Collapse all" : "Expand all"}</button>` : ""}
       <button class="btn" id="rep-xlsx">⬇ Excel</button>
     </div>
+    ${M.mismatch.length ? `<p class="warn">⚠ בחודשים ${M.mismatch.map((x) => `${MONTHS[x.i]} (הפרש ${money(x.diff)})`).join(", ")} התנועות בטבלה לא מסתכמות ליתרה של הבנק. ייתכן שיש שורות כפולות או חסרות (למשל קובץ שנטען פעמיים עם "הוספה בלבד"). היתרות בדוח לקוחות מהבנק עצמו.</p>` : ""}
     ${uncats ? `<p class="warn">⚠ ${money(uncats)} ₪ בשנה הזאת בלי Category (שורת Uncategorized). אפשר לסווג אותן בטבלה ${esc(r.table)}.</p>` : ""}
     <div class="report-grid" dir="ltr">
       <div class="table-wrap"><table class="data report"><thead><tr><th class="lbl">Category</th>${MONTHS.map((m) => `<th>${m}</th>`).join("")}<th>Total</th></tr></thead><tbody>

@@ -633,7 +633,7 @@ $("view-tables").addEventListener("click", async (e) => {
   const th = t.closest("th[data-sort]");
   if (th) { const k = th.dataset.sort; state.sort = state.sort?.key === k ? (state.sort.dir > 0 ? { key: k, dir: -1 } : null) : { key: k, dir: 1 }; return render(); }
   const td = t.closest("td.cell");
-  if (td && !td.querySelector("input")) return startEdit(+td.parentElement.dataset.row, td.dataset.col);
+  if (td && !td.querySelector("input, select")) return startEdit(+td.parentElement.dataset.row, td.dataset.col); // a click inside the open dropdown is not a new edit
   const del = t.closest("[data-del]");
   if (del) {
     if (!confirm("למחוק את השורה?")) return;
