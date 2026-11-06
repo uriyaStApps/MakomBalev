@@ -10,6 +10,7 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
 // one upload button per subject; each subject loads into its own table
 const TOPICS = [
   { id: "cashflow", label: "טעינת cash flow", table: "Cash Flow", derive: deriveCashFlow },
+  { id: "outflow", label: "טעינת cash flow outflow uptoday", table: "Cash Flow Outflow Uptoday", derive: deriveCashFlow },
   { id: "categories", label: "טעינת קטגוריות", table: "Categories" },
 ];
 // Cash Flow's "Category" is chosen by hand from the Categories table (manual = kept when the period is reloaded)
@@ -232,7 +233,8 @@ function guessTarget(name, t) {
   const byName = state.datasets.find((d) => d.name === name);
   if (byName) return byName;
   const labels = t.columns.filter((c) => !c.manual && c.label !== NAME_LABEL).map((c) => c.label); // "שם"/"Category" are ours, not the bank's
-  return labels.length ? state.datasets.find((d) => labels.every((l) => d.columns.some((c) => c.label === l))) : null;
+  const free = state.datasets.filter((d) => !TOPICS.some((x) => x.table === d.name)); // other subjects' tables are never guessed
+  return labels.length ? free.find((d) => labels.every((l) => d.columns.some((c) => c.label === l))) : null;
 }
 
 $("upload-file").addEventListener("change", async (e) => {
