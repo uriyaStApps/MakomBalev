@@ -724,7 +724,7 @@ async function downloadAll() {
 // ---------------- tables view ----------------
 async function openDataset(id) {
   state.ds = state.datasets.find((d) => d.id === id);
-  state.q = ""; state.sort = null; state.shown = SHOW; state.editing = null;
+  state.q = ""; state.sort = null; state.shown = SHOW; state.editing = null; state.mExtra = []; state.mYear = null;
   $("status").textContent = "טוען…";
   try {
     state.rows = await loadRows(id);
@@ -788,6 +788,8 @@ function renderTables() {
     return;
   }
   const { ds } = state;
+  const mc = matrixCols(ds);
+  if (mc && state.view !== "rows") return renderMatrixView(el, ds, mc);
   const rows = filteredRows();
   const arrow = (k) => state.sort?.key === k ? (state.sort.dir > 0 ? " ▲" : " ▼") : "";
   el.innerHTML = `<div class="toolbar">
@@ -799,6 +801,7 @@ function renderTables() {
       <button class="btn" id="btn-dl">⬇ אקסל</button>
       ${topicOf(ds)?.derive ? `<button class="btn" id="btn-derive" title="ממלא את עמודת &quot;שם&quot; בשורות שבהן היא ריקה">🔄 חילוץ שמות</button>` : ""}
       <button class="btn" id="btn-rename">שינוי שם</button>
+      ${mc ? `<button class="btn" id="btn-view-matrix">▦ תצוגת מטריצה</button>` : ""}
       ${isAdmin ? `<button class="btn danger" id="btn-del-ds">מחיקת טבלה</button>` : ""}
     </div>
     <p class="muted">${rows.length === state.rows.length ? `${rows.length} שורות` : `${rows.length} מתוך ${state.rows.length} שורות`} · לחיצה על תא לעריכה · לחיצה על כותרת למיון · מספר שורה בירוק = נוספה באתר</p>
@@ -809,6 +812,118 @@ function renderTables() {
       <td><button class="row-del" data-del="${r.id}" title="מחיקת שורה">🗑</button></td></tr>`).join("")}</tbody></table></div>
     ${rows.length > state.shown ? `<button class="btn more" id="btn-more">הצגת עוד ${Math.min(SHOW, rows.length - state.shown)}</button>` : ""}`;
   if (state.editing) startEdit(state.editing.row, state.editing.col);
+}
+
+// ---------------- matrix view (category / month / type / amount tables, e.g. Cash Flow Outflow Uptoday) ----------------
+// Categories down (under Inflows / Outflows), months across. A cell = the sum of its rows; editing it updates,
+// adds or (when cleared) deletes those rows, so the table underneath stays category / month / type / amount.
+const M_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+function matrixCols(ds) {
+  const find = (re) => ds.columns.find((c) => re.test(c.label));
+  const cat = ds.columns.find((c) => CAT_RE.test(c.label) && !c.manual), month = find(/^\s*month\s*$|חודש/i), amt = find(/amount|סכום/i);
+  return cat && month && amt ? { cat, month, amt, type: find(/^\s*type\s*$|סוג/i) } : null;
+}
+const mFmt = (v) => (v ? v.toLocaleString("en-US", { maximumFractionDigits: 2 }) : "");
+function matrixModel(ds, mc) {
+  const years = [...new Set(state.rows.map((r) => Math.floor(Number(r.data[mc.month.key]) / 100)).filter((y) => y > 1900))].sort();
+  if (!years.includes(state.mYear)) state.mYear = years[years.length - 1] ?? new Date().getFullYear();
+  const Y = state.mYear;
+  const types = mc.type ? CATEGORY_TYPES : [null];
+  const order = state.lookups?.[CATEGORIES_TABLE] || [];
+  const sections = types.map((type) => {
+    const cats = new Map();
+    for (const r of state.rows) {
+      const ym = Number(r.data[mc.month.key]);
+      if (Math.floor(ym / 100) !== Y || (type && r.data[mc.type.key] !== type)) continue;
+      const cat = String(r.data[mc.cat.key] ?? "").trim() || "(בלי קטגוריה)";
+      if (!cats.has(cat)) cats.set(cat, Array(12).fill(0));
+      cats.get(cat)[(ym % 100) - 1] += Number(r.data[mc.amt.key]) || 0;
+    }
+    for (const x of state.mExtra || []) if (x.type === type && x.year === Y && !cats.has(x.cat)) cats.set(x.cat, Array(12).fill(0));
+    const idx = (c) => { const i = order.findIndex((o) => o.trim().toLowerCase() === c.toLowerCase()); return i < 0 ? 1e9 : i; };
+    const list = [...cats.entries()].map(([cat, m]) => ({ cat, m })).sort((a, b) => idx(a.cat) - idx(b.cat) || a.cat.localeCompare(b.cat));
+    return { type, list, total: Array(12).fill(0).map((_, i) => list.reduce((s, c) => s + c.m[i], 0)) };
+  });
+  return { years, Y, sections };
+}
+function renderMatrixView(el, ds, mc) {
+  const M = matrixModel(ds, mc);
+  const sum = (a) => a.reduce((s, v) => s + v, 0);
+  const options = (sec) => (state.lookups?.[CATEGORIES_TABLE] || []).filter((c) => !sec.list.some((x) => x.cat.toLowerCase() === c.trim().toLowerCase()));
+  el.innerHTML = `<div class="toolbar">
+      <button class="btn" id="btn-back">→ כל הטבלאות</button>
+      <h2>${esc(ds.name)}</h2>
+      <label>שנה <select id="m-year">${(M.years.length ? M.years : [M.Y]).map((y) => `<option${y === M.Y ? " selected" : ""}>${y}</option>`).join("")}</select></label>
+      <button class="btn" id="btn-m-xlsx">⬇ אקסל (מטריצה)</button>
+      <button class="btn" id="btn-view-rows">☰ תצוגת שורות</button>
+      <button class="btn" id="btn-rename">שינוי שם</button>
+      ${isAdmin ? `<button class="btn danger" id="btn-del-ds">מחיקת טבלה</button>` : ""}
+    </div>
+    <p class="muted">לחיצה על תא לעריכת הסכום · מחיקת הסכום ושמירה מוחקת אותו · השינויים נשמרים בטבלה (category / month / type / amountNIS)</p>
+    <div class="report-grid one" dir="ltr"><div class="table-wrap"><table class="data report matrix"><thead><tr><th class="lbl">Category</th>${M_NAMES.map((m) => `<th>${m}</th>`).join("")}<th>Total</th></tr></thead><tbody>
+    ${M.sections.map((sec) => `
+      ${sec.type ? `<tr class="sec"><td class="lbl">${sec.type}</td><td colspan="13"></td></tr>` : ""}
+      ${sec.list.map((c) => `<tr><td class="lbl">${esc(c.cat)}</td>${c.m.map((v, i) => `<td class="num mcell" data-cat="${esc(c.cat)}" data-m="${i + 1}" data-type="${esc(sec.type ?? "")}">${mFmt(v)}</td>`).join("")}<td class="num ytot">${mFmt(sum(c.m))}</td></tr>`).join("")}
+      <tr class="addcat"><td class="lbl" colspan="14"><select class="m-add" data-type="${esc(sec.type ?? "")}"><option value="">+ הוספת קטגוריה${sec.type ? ` ל-${sec.type}` : ""}</option>${options(sec).map((c) => `<option>${esc(c)}</option>`).join("")}</select></td></tr>
+      <tr class="total"><td class="lbl">Total ${sec.type ? sec.type.toLowerCase() : ""}</td>${sec.total.map((v) => `<td class="num">${mFmt(v)}</td>`).join("")}<td class="num ytot">${mFmt(sum(sec.total))}</td></tr>`).join("")}
+    ${M.sections.length === 2 ? (() => { const net = M.sections[0].total.map((v, i) => v - M.sections[1].total[i]); return `<tr class="total net"><td class="lbl">Net Cashflows</td>${net.map((v) => `<td class="num">${mFmt(v)}</td>`).join("")}<td class="num ytot">${mFmt(sum(net))}</td></tr>`; })() : ""}
+    </tbody></table></div></div>`;
+  state.mModel = M;
+}
+async function setMatrixCell(cat, m, type, val) {
+  const ds = state.ds, mc = matrixCols(ds), ym = state.mYear * 100 + m;
+  const same = (r) => String(r.data[mc.cat.key] ?? "").trim().toLowerCase() === cat.toLowerCase() && Number(r.data[mc.month.key]) === ym && (!mc.type || !type || r.data[mc.type.key] === type);
+  const rows = state.rows.filter(same);
+  try {
+    if (val == null || val === 0) {
+      if (!rows.length) return;
+      const { error } = await sb.from("dataset_rows").delete().in("id", rows.map((r) => r.id));
+      if (error) throw error;
+      state.rows = state.rows.filter((r) => !rows.includes(r));
+    } else if (!rows.length) {
+      const data = { [mc.cat.key]: cat, [mc.month.key]: ym, [mc.amt.key]: val };
+      if (mc.type && type) data[mc.type.key] = type;
+      const { data: row, error } = await sb.from("dataset_rows").insert({ dataset_id: ds.id, data, origin: "site" }).select().single();
+      if (error) throw error;
+      state.rows.push(row);
+    } else { // several rows in one cell: keep the others, adjust the first so the cell shows the new total
+      const rest = rows.slice(1).reduce((s, r) => s + (Number(r.data[mc.amt.key]) || 0), 0);
+      const data = { ...rows[0].data, [mc.amt.key]: Math.round((val - rest) * 100) / 100 };
+      const { data: row, error } = await sb.from("dataset_rows").update({ data }).eq("id", rows[0].id).select().single();
+      if (error) throw error;
+      Object.assign(rows[0], row);
+    }
+  } catch (err) { console.error(err); toast("השמירה נכשלה"); }
+}
+function matrixToExcel() {
+  const M = state.mModel, sum = (a) => a.reduce((s, v) => s + v, 0);
+  const aoa = [[state.ds.name, M.Y], [], ["Category", ...M_NAMES, "Total"]];
+  for (const sec of M.sections) {
+    if (sec.type) aoa.push([sec.type]);
+    sec.list.forEach((c) => aoa.push([c.cat, ...c.m.map((v) => v || null), sum(c.m)]));
+    aoa.push([`Total ${sec.type ? sec.type.toLowerCase() : ""}`, ...sec.total.map((v) => v || null), sum(sec.total)]);
+  }
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws["!cols"] = [{ wch: 32 }, ...M_NAMES.map(() => ({ wch: 11 })), { wch: 12 }];
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, String(M.Y));
+  XLSX.writeFile(wb, `${state.ds.name} ${M.Y}.xlsx`);
+}
+function startMatrixEdit(td) {
+  const cur = td.textContent.replace(/,/g, "");
+  td.innerHTML = `<input type="text" dir="ltr" value="${esc(cur)}">`;
+  const input = td.querySelector("input");
+  input.focus(); input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return; done = true;
+    const v = input.value.trim() === "" ? null : Number(input.value.replace(/,/g, ""));
+    if (save && v !== null && isNaN(v)) { toast("צריך להקליד מספר"); render(); return; }
+    const before = cur === "" ? null : Number(cur);
+    if (save && v !== before) await setMatrixCell(td.dataset.cat, +td.dataset.m, td.dataset.type || null, v);
+    render();
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); input.blur(); } if (e.key === "Escape") finish(false); });
+  input.addEventListener("blur", () => finish(true));
 }
 
 function startEdit(rowId, col) {
@@ -855,6 +970,10 @@ function startEdit(rowId, col) {
 $("view-tables").addEventListener("click", async (e) => {
   const t = e.target;
   if (t.closest("#btn-upload")) return openUpload();
+  const mcell = t.closest("td.mcell"); if (mcell && !mcell.querySelector("input")) return startMatrixEdit(mcell);
+  if (t.closest("#btn-view-rows")) { state.view = "rows"; return render(); }
+  if (t.closest("#btn-view-matrix")) { state.view = "matrix"; return render(); }
+  if (t.closest("#btn-m-xlsx")) return matrixToExcel();
   const tp = t.closest("[data-topic]"); if (tp) return openUpload(TOPICS.find((x) => x.id === tp.dataset.topic));
   if (t.closest("#btn-dl-all")) return downloadAll();
   const card = t.closest("[data-open]"); if (card) return openDataset(+card.dataset.open);
@@ -909,6 +1028,13 @@ $("view-tables").addEventListener("contextmenu", (e) => { // right-click a heade
   const col = state.ds.columns.find((c) => c.key === th.dataset.sort);
   const label = prompt("שם חדש לעמודה:", col.label)?.trim(); if (!label || label === col.label) return;
   saveColumns(state.ds.columns.map((c) => (c.key === col.key ? { ...c, label } : c)));
+});
+$("view-tables").addEventListener("change", (e) => {
+  if (e.target.id === "m-year") { state.mYear = Number(e.target.value); return render(); }
+  if (e.target.classList.contains("m-add") && e.target.value) { // an empty row for a category, filled by typing amounts
+    (state.mExtra = state.mExtra || []).push({ cat: e.target.value.trim(), type: e.target.dataset.type || null, year: state.mYear });
+    return render();
+  }
 });
 $("view-tables").addEventListener("input", (e) => {
   if (e.target.id !== "q") return;
