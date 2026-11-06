@@ -664,7 +664,9 @@ $("view-tables").addEventListener("click", async (e) => {
     state.ds.name = name; return render();
   }
   if (t.closest("#btn-del-ds")) {
-    if (prompt(`מחיקת הטבלה "${state.ds.name}" וכל ${state.rows.length} השורות שלה. כדי לאשר, הקלידו את שם הטבלה:`) !== state.ds.name) return;
+    const typed = prompt(`מחיקת הטבלה "${state.ds.name}" וכל ${state.rows.length} השורות שלה. כדי לאשר, הקלידו את שם הטבלה:`);
+    if (typed === null) return; // cancelled
+    if (typed.trim() !== state.ds.name) return toast(`השם שהוקלד ("${typed.trim()}") לא תואם לשם הטבלה, ולכן הטבלה לא נמחקה.`, 5000);
     const { error } = await sb.from("datasets").delete().eq("id", state.ds.id);
     if (error) return toast("המחיקה נכשלה");
     state.ds = null; await loadDatasets(); toast("הטבלה נמחקה"); return render();
