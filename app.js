@@ -309,8 +309,11 @@ function sheetToTable(ws) {
   const body = aoa.slice(hi + 1).map((r) => r.map(cellValue)).filter((r) => r.some((v) => v !== null));
   // Leumi's CSV: the header row starts one cell later than the data rows -> every title lands one column off.
   // If the header has more empty cells in front than any data row, line it up with the data.
+  // Only when MOST data rows start earlier (a few side notes in column B, as in CashFlow Projection, don't count).
   const lead = (r) => { const i = r.findIndex((v) => v !== null && v !== undefined); return i < 0 ? Infinity : i; };
-  const shift = lead(header) - Math.min(...body.map(lead));
+  const leads = {}; body.forEach((r) => { const l = lead(r); leads[l] = (leads[l] || 0) + 1; });
+  const [common, n] = Object.entries(leads).sort((a, b) => b[1] - a[1])[0] || [Infinity, 0];
+  const shift = n >= body.length * 0.8 ? lead(header) - Number(common) : 0;
   if (body.length && shift > 0 && shift < Infinity) header = header.slice(shift);
   let width = body.reduce((w, r) => Math.max(w, r.length), header.length);
   // a summary block next to the data (e.g. a monthly matrix to the side) is not part of the table:
@@ -328,14 +331,46 @@ function sheetToTable(ws) {
   columns.forEach((c) => delete c.i);
   return { columns, rows, skipped };
 }
+// ---------------- month matrix (CashFlow Projection): categories down, months across ----------------
+// -> rows of category / month (YYYYMM) / type / amountNIS, like the outflow table. Type = the section the row sits in.
+const MONTH_KEYS = [["jan", "ינו"], ["feb", "fab", "פבר"], ["mar", "מרץ", "מרס"], ["apr", "אפר"], ["may", "mai", "מאי"], ["jun", "יונ"],
+  ["jul", "יול"], ["aug", "אוג"], ["sep", "ספט"], ["oct", "אוק"], ["nov", "נוב"], ["dec", "דצמ"]];
+const monthOf = (label) => { const s = String(label ?? "").trim().toLowerCase(); const i = MONTH_KEYS.findIndex((ks) => ks.some((k) => s.startsWith(k))); return i < 0 ? null : i + 1; };
+const MATRIX_COLS = [{ key: "c1", label: "category", type: "text" }, { key: "c2", label: "month", type: "number" }, { key: "c3", label: "type", type: "text" }, { key: "c4", label: "amountNIS", type: "number" }];
+function asMatrix(t) {
+  const months = t.columns.map((c) => ({ c, m: monthOf(c.label) })).filter((x) => x.m);
+  if (months.length < 6) return null;
+  const catCol = t.columns.find((c) => CAT_RE.test(c.label)) || t.columns.find((c) => !monthOf(c.label));
+  if (!catCol) return null;
+  const items = []; let type = null;
+  for (const r of t.rows) {
+    const label = r[catCol.key];
+    if (typeof label !== "string") continue;
+    const s = label.trim();
+    if (/^inflows?$/i.test(s)) { type = "Inflows"; continue; }
+    if (/^outflows?$/i.test(s)) { type = "Outflows"; continue; }
+    if (/^total/i.test(s)) { type = null; continue; }
+    if (/ending|closing/i.test(s)) break; // below this: other accounts (PayPal), notes and name lists
+    if (!type || /opening|net cash|balance|last date/i.test(s)) continue;
+    for (const { c, m } of months) { const v = r[c.key]; if (typeof v === "number" && v !== 0) items.push({ category: s, m, type, amount: v }); }
+  }
+  return items.length ? { items, categories: new Set(items.map((x) => `${x.type}:${x.category}`)).size } : null;
+}
+const matrixRows = (mx, year) => mx.items.map((x) => ({ c1: x.category, c2: year * 100 + x.m, c3: x.type, c4: x.amount }));
+const yearFromName = (name) => { const all = String(name).match(/20\d{2}(?!\d)/g); return all ? Number(all[all.length - 1]) : new Date().getFullYear(); };
+
 // Hebrew that was already lost before the file reached us (saved as "????") can't be recovered
 const lostHebrew = (t) => [...t.columns.map((c) => c.label), ...t.rows.slice(0, 50).flatMap((r) => Object.values(r))]
   .some((v) => typeof v === "string" && /\?{2,}/.test(v));
 
 let upload = null; // { file, topic, tables: {sheetName: {columns, rows, skipped}} }
 let uploadTopic = null; // the subject button that opened the dialog (null = general upload)
-const dmy = (iso) => iso ? iso.slice(0, 10).split("-").reverse().join("/") : "";
-const day = (v) => (typeof v === "string" && /^\d{4}-\d\d-\d\d/.test(v) ? v.slice(0, 10) : null);
+// a row's period: a date ("2026-01-30") or a month ("202601"); both compare correctly as text
+const dmy = (p) => !p ? "" : /^\d{6}$/.test(p) ? `${p.slice(4)}/${p.slice(0, 4)}` : p.slice(0, 10).split("-").reverse().join("/");
+const day = (v) => (typeof v === "string" && /^\d{4}-\d\d-\d\d/.test(v) ? v.slice(0, 10) : /^\d{6}$/.test(String(v ?? "")) ? String(v) : null);
+// the column that marks a row's period: card charge date, else the first date, else a month column
+const periodCol = (cols) => cols.find((c) => c.type === "date" && /חיוב|charge|billing/i.test(c.label)) || cols.find((c) => c.type === "date")
+  || cols.find((c) => /^\s*month\s*$|חודש/i.test(c.label));
 function dateRange(values) {
   const ds = values.map(day).filter(Boolean).sort();
   return ds.length ? { from: ds[0], to: ds[ds.length - 1] } : null;
@@ -355,7 +390,7 @@ function mapToTable(ds, t) {
   }
   const rows = t.rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [map[k], v])));
   // card statements: the charge date is the same for the whole monthly file, so it marks the file's period exactly
-  const fileDate = t.columns.find((c) => c.type === "date" && /חיוב|charge|billing/i.test(c.label)) || t.columns.find((c) => c.type === "date");
+  const fileDate = periodCol(t.columns);
   // the bank's own columns identify a row; used to carry hand-picked values over when a period is reloaded
   const sigKeys = t.columns.filter((c) => !c.manual && c.label !== NAME_LABEL).map((c) => map[c.key]);
   return { cols, rows, dateKey: fileDate ? map[fileDate.key] : null, sigKeys };
@@ -408,16 +443,22 @@ $("upload-file").addEventListener("change", async (e) => {
     const safe = (n) => { try { return sheetToTable(wb.Sheets[n]); } catch (err) { console.error(n, err); return { columns: [], rows: [], skipped: [], broken: true }; } };
     upload = { file, topic: uploadTopic, tables: Object.fromEntries(wb.SheetNames.map((n) => [n, safe(n)])) };
   } catch (err) { console.error(err); toast("לא הצלחתי לקרוא את הקובץ"); return; }
+  for (const t of Object.values(upload.tables)) { // a month matrix becomes category / month / type / amountNIS rows
+    const mx = asMatrix(t);
+    if (mx) { t.matrix = mx; t.year = yearFromName(file.name); t.columns = MATRIX_COLS.map((c) => ({ ...c })); t.rows = matrixRows(mx, t.year); }
+  }
   Object.values(upload.tables).forEach((t) => { t.fits = fitsOf(t); t.kind = isBank(t) ? "bank" : isCard(t) ? "card" : null; }); // before our own columns are added
   // name + Category columns for any file that fits a subject with a derive rule (the account question may still change the subject)
   if (upload.topic?.derive) Object.values(upload.tables).forEach((t) => { if (t.fits.some((id) => TOPICS.find((x) => x.id === id)?.derive)) deriveCashFlow(t); });
   const opts = state.datasets.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("");
   $("upload-sheets").innerHTML = Object.entries(upload.tables).map(([name, t]) => {
-    const dc = t.columns.find((c) => c.type === "date" && /חיוב|charge|billing/i.test(c.label)) || t.columns.find((c) => c.type === "date");
+    const dc = periodCol(t.columns);
     const r = dc && dateRange(t.rows.map((x) => x[dc.key]));
     return `<div class="sheet-opt" data-sheet="${esc(name)}">
       <label><input type="checkbox" class="s-on" ${t.rows.length ? "checked" : ""}> <b>${esc(name)}</b> <span class="muted">${t.rows.length} שורות · ${t.columns.length} עמודות</span></label>
-      ${r ? `<div>📅 תאריכים בקובץ: <b>${dmy(r.from)} – ${dmy(r.to)}</b> <span class="muted">(לפי העמודה "${esc(dc.label)}")</span></div>` : ""}
+      ${t.matrix ? `<div class="matrix-note">🔁 זוהתה טבלת חודשים (קטגוריות × חודשים, ${t.matrix.categories} קטגוריות). היא הומרה ל-${t.rows.length} שורות של category / month / type / amountNIS. סכומים, Net ויתרות לא נטענים (הדוח מחשב אותם).
+        <label>לאיזו שנה החודשים? <input type="number" class="s-year" value="${t.year}" min="2000" max="2100" dir="ltr"></label></div>` : ""}
+      ${r ? `<div class="s-range">📅 ${dc.type === "date" ? "תאריכים" : "חודשים"} בקובץ: <b>${dmy(r.from)} – ${dmy(r.to)}</b> <span class="muted">(לפי העמודה "${esc(dc.label)}")</span></div>` : ""}
       ${t.columns.length ? `<div class="muted">עמודות: ${t.columns.map((c) => esc(c.label)).join(" · ")}</div>` : ""}
       ${t.skipped.length ? `<details class="muted"><summary>${t.skipped.length} שורות כותרת מעל הטבלה הושמטו</summary>${t.skipped.map((s) => `<div>${esc(s)}</div>`).join("")}</details>` : ""}
       ${lostHebrew(t) ? `<div class="warn">⚠ בקובץ מופיעים סימני שאלה במקום עברית. העברית כבר אבדה בקובץ עצמו (כנראה נשמר מחדש בתוכנה אחרת). כדאי להוריד אותו שוב מהבנק ולהעלות כמו שהוא, בלי לפתוח ולשמור.</div>` : ""}
@@ -451,6 +492,14 @@ $("upload-file").addEventListener("change", async (e) => {
       if (guess) el.querySelector(".s-target").value = guess.id;
     }
     el.sync = () => planSheet(el, i, t);
+    el.querySelector(".s-year")?.addEventListener("change", (e) => { // month matrix: the year its months belong to
+      const y = Number(e.target.value);
+      if (!(y >= 2000 && y <= 2100)) return;
+      t.year = y; t.rows = matrixRows(t.matrix, y);
+      const rr = dateRange(t.rows.map((x) => x.c2));
+      const line = el.querySelector(".s-range b"); if (line && rr) line.textContent = `${dmy(rr.from)} – ${dmy(rr.to)}`;
+      el.sync();
+    });
     el.querySelector(".s-target").addEventListener("change", el.sync);
     el.sync();
   });

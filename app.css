@@ -72,6 +72,8 @@ table.data td input { width: 100%; min-width: 120px; font: inherit; padding: 3px
 .acct-kind { font-size: 13px; color: var(--muted); }
 .acct-num { font-weight: 500; direction: rtl; }
 .acct-btns { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.matrix-note { padding: 8px 10px; border-radius: 8px; background: var(--soft); display: grid; gap: 6px; }
+.matrix-note input { width: 90px; }
 .acct-pick { gap: 6px; }
 .acct-pick .found { color: #2e7d32; }
 .ok { padding: 8px 10px; border-radius: 8px; background: #e8f5e9; color: #1b5e20; border: 1px solid #66bb6a; }
