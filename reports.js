@@ -209,7 +209,7 @@ function avgPageCalc(f, M) {
 function avgPage(r, f, M) {
   const a = r.avgPage && avgPageCalc(f, M);
   if (!a) return "";
-  return `<span class="avg-page" dir="ltr" id="avg-page" title="Double-click: how it's calculated">AVG Pase <b>${a.v.toFixed(2)}</b>${a.until ? ` <span class="muted">until ${a.until}</span>` : ""}</span>`;
+  return `<span class="avg-page" dir="ltr" id="avg-page" title="Double-click: how it's calculated">AVG Pase <b>${a.v.toFixed(2)}</b>${a.until ? ` <span class="muted">until ${a.until}</span>` : ""}${a.pc ? "" : ` <span class="warn" title="No movement is mapped to Partisipans Paymant this year - nothing was subtracted">⚠</span>`}</span>`;
 }
 function avgPageDrill() {
   const { f, M } = rep.last, a = avgPageCalc(f, M);
@@ -227,10 +227,11 @@ function avgPageDrill() {
   dlg.innerHTML = `<div dir="ltr">
     <h3>AVG Pase ${rep.year}: ${a.v.toFixed(2)}${a.until ? ` <span class="muted">(until ${a.until})</span>` : ""}</h3>
     <p class="muted formula">Current bank balance / ((Total Outflow − Partisipans Paymant) / 12)</p>
+    ${a.pc ? "" : `<p class="blocked" dir="rtl">⚠ אף תאור תנועה ב-${MOVEMENT_TABLE} לא משויך עדיין לקטגוריה Partisipans Paymant, ולכן לא הופחת כלום והתוצאה נמוכה מדי. שייכו את תשלומי המשתתפים ב-${MOVEMENT_TABLE}.</p>`}
     <table class="data avg-calc"><tbody>
       ${row(`<b>Numerator</b>: current bank balance <span class="muted">(<bdi>${esc(acct)}</bdi>, ${day})</span>`, n2(a.last.close), "key")}
       ${row(`Total Outflow ${rep.year}`, n2(a.out))}
-      ${row(`− ${a.pc ? esc(a.pc.cat) : "Partisipans Paymant"} ${rep.year} <span class="muted">(inflow)</span>`, a.pc ? `−${n2(a.part)}` : "0.00 <span class=\"muted\">(none this year)</span>")}
+      ${row(`− ${a.pc ? esc(a.pc.cat) : "Partisipans Paymant"} ${rep.year} <span class="muted">(inflow)</span>`, a.pc ? `−${n2(a.part)}` : `<span class="warn" title="No movement is mapped to Partisipans Paymant in ${rep.year}">0.00 ⚠</span>`)}
       ${row(`= Net outflow`, n2(a.out - a.part), "sub")}
       ${row(`<b>Denominator</b>: ÷ 12 = average month`, n2(a.monthly), "key")}
       ${row(`<b>AVG Pase</b> = ${n2(a.last.close)} / ${n2(a.monthly)}`, `<b>${a.v.toFixed(2)}</b>`, "total")}
