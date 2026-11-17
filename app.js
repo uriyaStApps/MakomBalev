@@ -762,11 +762,27 @@ async function loadLookups(ds) {
   }
 }
 
+// default order of every table: newest date first (the first date column, else a month YYYYMM column)
+function defaultSort(ds) {
+  const c = ds.columns.find((x) => x.type === "date") || ds.columns.find((x) => /^\s*month\s*$|חודש/i.test(x.label));
+  return c ? { key: c.key, dir: -1, auto: true } : null;
+}
+const effSort = () => state.sort || (state.ds ? defaultSort(state.ds) : null);
+
 function filteredRows() {
-  const { ds, q, sort } = state;
+  const { ds, q } = state;
+  const sort = effSort();
   let rows = state.rows;
   if (q) { const needle = q.toLowerCase(); rows = rows.filter((r) => ds.columns.some((c) => showValue(r.data[c.key], c.type).toLowerCase().includes(needle))); }
-  if (sort) {
+  if (sort?.auto) {
+    // empty date (e.g. a row just added) on top; same date -> later posted first
+    const k = sort.key, v = (r) => r.data[k] == null || r.data[k] === "" ? null : String(r.data[k]);
+    rows = [...rows].sort((a, b) => {
+      const x = v(a), y = v(b);
+      if (x === null || y === null) return (x === null ? -1 : 0) - (y === null ? -1 : 0) || b.id - a.id;
+      return y.localeCompare(x, "en", { numeric: true }) || b.id - a.id;
+    });
+  } else if (sort) {
     const { key, dir } = sort;
     rows = [...rows].sort((a, b) => {
       const x = a.data[key], y = b.data[key];
@@ -805,7 +821,7 @@ function renderTables() {
   const mc = matrixCols(ds);
   if (mc && state.view !== "rows") return renderMatrixView(el, ds, mc);
   const rows = filteredRows();
-  const arrow = (k) => state.sort?.key === k ? (state.sort.dir > 0 ? " ▲" : " ▼") : "";
+  const arrow = (k) => effSort()?.key === k ? (effSort().dir > 0 ? " ▲" : " ▼") : "";
   el.innerHTML = `<div class="toolbar">
       <button class="btn" id="btn-back">→ כל הטבלאות</button>
       <h2>${esc(ds.name)}</h2>
@@ -1046,7 +1062,13 @@ $("view-tables").addEventListener("click", async (e) => {
   if (t.closest("#btn-more")) { state.shown += SHOW; return render(); }
   if (t.closest("#btn-dl")) return saveWorkbook([[state.ds, filteredRows()]], `${state.ds.name}_${stamp()}.xlsx`);
   const th = t.closest("th[data-sort]");
-  if (th) { const k = th.dataset.sort; state.sort = state.sort?.key === k ? (state.sort.dir > 0 ? { key: k, dir: -1 } : null) : { key: k, dir: 1 }; return render(); }
+  if (th) {
+    // click: asc -> desc -> back to the default (date, newest first); on the date column itself just flip
+    const k = th.dataset.sort, cur = effSort(), def = defaultSort(state.ds);
+    if (def?.key === k) state.sort = cur?.key === k && cur.dir < 0 ? { key: k, dir: 1 } : null;
+    else state.sort = cur?.key === k ? (cur.dir > 0 ? { key: k, dir: -1 } : null) : { key: k, dir: 1 };
+    return render();
+  }
   const td = t.closest("td.cell");
   if (td && !td.querySelector("input, select")) return startEdit(+td.parentElement.dataset.row, td.dataset.col); // a click inside the open dropdown is not a new edit
   const del = t.closest("[data-del]");
