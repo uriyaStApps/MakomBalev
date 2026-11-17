@@ -68,7 +68,7 @@ function detectNumber(t, kind) {
   }
   // card: "המסתיים ב-1234", "כרטיס 1234", "****1234", or a column of last-4 digits
   const text = [...t.skipped, ...t.columns.map((c) => c.label)].join(" ");
-  const m = text.match(/(?:המסתיים\s*ב-?|מסתיים\s*ב-?|כרטיס[^\d]{0,20}|card[^\d]{0,20}|\*{2,})(\d{4})(?!\d)/i);
+  const m = text.match(/(?:המסתיים\s*ב-?|מסתיים\s*ב-?|כרטיס[^\d]{0,30}|card[^\d]{0,20}|\*{2,})(\d{4})(?!\d)/i);
   if (m) return m[1];
   const col = t.columns.find((c) => /4 ספרות|ספרות אחרונות|מספר כרטיס|last 4|card/i.test(c.label));
   if (col) {
@@ -388,7 +388,39 @@ async function readWorkbook(file) {
   let text;
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(buf); }
   catch { text = new TextDecoder("windows-1255").decode(buf); }
-  return XLSX.read(text.replace(/^﻿/, ""), { type: "string", raw: true }); // raw: we parse numbers/dates (day first) ourselves
+  text = text.replace(/^﻿/, "").replace(/^\s+(?=<)/, ""); // Leumi's card "xls" starts with blank lines: then it isn't seen as HTML
+  if (/^</.test(text) && /<table/i.test(text)) { const wb = cardStatementBook(text); if (wb) return wb; }
+  return XLSX.read(text, { type: "string", raw: true }); // raw: we parse numbers/dates (day first) ourselves
+}
+// Leumi credit card statement (HTML "xls"): a title table ("פרוט עסקאות לכרטיס ... 8412 לתקופה: דצמבר 2025") and one
+// table per section ("עסקאות בש"ח במועד החיוב", "עסקאות מחויבות בש"ח (לידיעה בלבד)" ...), each with the same header
+// and a "סה"כ" line. -> one sheet: the title lines on top, then all sections' transactions together, plus
+// "סעיף" (which section) and "תקופת חיוב" (the statement's month, so reloading a month replaces exactly that statement).
+const HE_MONTHS = ["ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני", "יולי", "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר"];
+function cardStatementBook(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const cellText = (td) => td.textContent.replace(/[\s‎‏]+/g, " ").trim();
+  const tables = [...doc.querySelectorAll("table")].filter((tb) => !tb.querySelector("table")) // innermost tables only
+    .map((tb) => [...tb.querySelectorAll("tr")].map((tr) => [...tr.querySelectorAll("td,th")].map(cellText)));
+  const isHead = (r) => r.some((v) => /תאריך/.test(v)) && r.some((v) => /סכום/.test(v)) && r.filter(Boolean).length >= 3;
+  const titles = [], out = [];
+  let header = null;
+  for (const rows of tables) {
+    const hi = rows.findIndex(isHead);
+    if (hi < 0) { titles.push(...rows.map((r) => r.filter(Boolean).join(" ")).filter(Boolean)); continue; }
+    if (!header) header = rows[hi];
+    else if (rows[hi].join("|") !== header.join("|")) return null; // sections that don't look alike: not this format
+    const section = rows.slice(0, hi).map((r) => r.filter(Boolean).join(" ")).filter(Boolean).join(" ");
+    for (const r of rows.slice(hi + 1)) if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(r[0] || "")) out.push([...r.slice(0, header.length), section]); // skips "סה"כ"
+  }
+  if (!header || !out.length) return null;
+  const pm = titles.join(" ").match(/לתקופה\s*:?\s*([א-ת]+)\s+(\d{4})/);
+  const mi = pm ? HE_MONTHS.findIndex((m) => pm[1].startsWith(m.slice(0, 3))) : -1;
+  const period = mi >= 0 ? `01/${String(mi + 1).padStart(2, "0")}/${pm[2]}` : null;
+  const aoa = [...titles.map((t) => [t]), [...header, "סעיף", ...(period ? ["תקופת חיוב"] : [])], ...out.map((r) => (period ? [...r, period] : r))];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), "Sheet1");
+  return wb;
 }
 function guessType(values) {
   const vals = values.filter((v) => v !== null);
