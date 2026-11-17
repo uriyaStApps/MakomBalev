@@ -130,3 +130,5 @@ table.report td.ytot { font-weight: 700; border-left: 2px solid var(--line); }
 .rep-tip .tip-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rep-tip .tip-amt { font-variant-numeric: tabular-nums; }
 @media (prefers-color-scheme: dark) { .rep-tip { background: #2f2d1f; color: #e8e8ea; border-color: #5c5735; } .rep-tip .tip-day { color: #9a9ea6; } }
+.avg-page { display: inline-flex; align-items: baseline; gap: 6px; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); cursor: help; }
+.avg-page b { font-size: 18px; color: var(--accent); }

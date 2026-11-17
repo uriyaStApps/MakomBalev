@@ -22,7 +22,7 @@ async function retireOutflowTable() {
   if (!ds || !isAdmin) return;
   try { if (localStorage.getItem("mb_keep_outflow_table")) return; } catch {}
   const n = state.counts[ds.id] ?? 0;
-  if (!confirm(`הדוח Cash Flow Outflow Uptoday נבנה עכשיו מחשבון הבנק ומשני הכרטיסים (לפי Movement Mapping).\n\nלמחוק את הטבלה "${RETIRED_TABLE}" (${n} שורות)? אין דרך חזרה.\n(ביטול = להשאיר אותה, בלי לשאול שוב)`)) {
+  if (!confirm(`הדוח FC Monthly (לשעבר Cash Flow Outflow Uptoday) נבנה עכשיו מחשבון הבנק ומשני הכרטיסים (לפי Movement Mapping).\n\nלמחוק את הטבלה "${RETIRED_TABLE}" (${n} שורות)? אין דרך חזרה.\n(ביטול = להשאיר אותה, בלי לשאול שוב)`)) {
     try { localStorage.setItem("mb_keep_outflow_table", "1"); } catch {}
     return;
   }
