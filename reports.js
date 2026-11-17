@@ -191,15 +191,18 @@ function buildMatrix(f, year, opening0, tl) {
     annual: { avgIn: yearOf(tin) / active, avgOut: yearOf(tout) / active, months: has.filter(Boolean).length, sections } };
 }
 
-// "Avg page": how many months of the year's average outflow the current bank balance covers
-// = the bank's latest balance / (the shown year's Total Outflow / 12)
+// "Avg page" (Uriya, 2026-11-17): how many months the current bank balance covers
+// = the bank's latest balance / ((the shown year's Total Outflow - its Partisipans Paymant inflow) / 12)
+const PARTICIPANTS = ["partisipans paymant", "participants payment", "partisipants payment"];
 function avgPage(r, f, M) {
   if (!r.avgPage || !f.tl?.length) return "";
-  const last = f.tl[f.tl.length - 1], out = M.yearOf(M.tout), monthly = out / 12;
+  const last = f.tl[f.tl.length - 1], out = M.yearOf(M.tout);
+  const pc = M.ins.find((c) => PARTICIPANTS.includes(norm(c.cat)));
+  const part = pc ? M.yearOf(pc.m) : 0, monthly = (out - part) / 12;
   if (!monthly) return "";
   const v = last.close / monthly;
   const fmt0 = (n) => Math.round(n).toLocaleString("en-US");
-  const why = `${fmt0(last.close)} (bank balance ${last.day.split("-").reverse().join("/")}) / (${fmt0(out)} Total Outflow ${rep.year} / 12 = ${fmt0(monthly)})`;
+  const why = `${fmt0(last.close)} (bank balance ${last.day.split("-").reverse().join("/")}) / ((${fmt0(out)} Total Outflow - ${fmt0(part)} ${pc ? pc.cat : "Partisipans Paymant: none this year"}) ${rep.year} / 12 = ${fmt0(monthly)})`;
   return `<span class="avg-page" dir="ltr" title="${esc(why)}">Avg page <b>${v.toFixed(2)}</b> <span class="muted">= ${fmt0(last.close)} / ${fmt0(monthly)}</span></span>`;
 }
 function openingFor(r, f, year) {
