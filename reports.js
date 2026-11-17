@@ -248,7 +248,7 @@ async function renderReports() {
   el.innerHTML = head + `<div class="toolbar">
       <label>Year <select id="rep-year">${years.map((y) => `<option${y === rep.year ? " selected" : ""}>${y}</option>`).join("")}</select></label>
       <label title="יתרת הפתיחה של ינואר. ריק = לפי חשבון הבנק (טבלת Cash Flow)">Opening balance
-        <input type="text" id="rep-open" dir="ltr" size="12" value="${op.value == null ? "" : Math.round(op.value * 100) / 100}" placeholder="${op.value == null ? "enter" : ""}">
+        <input type="text" id="rep-open" dir="ltr" size="12" value="${op.value == null ? "" : exact(op.value)}" placeholder="${op.value == null ? "enter" : ""}">
         <span class="muted">${op.manual ? "(manual)" : op.value == null ? "" : "(from bank)"}</span></label>
       ${avgPage(r, f, M)}
       <span class="grow"></span>
@@ -307,6 +307,10 @@ function reportToExcel() {
   aoa.push(["Total Outflow", Math.round(M.yearOf(M.tout) * 100) / 100], [], ["Annual Sections Cost"]);
   M.annual.sections.forEach((s) => aoa.push([s.label, Math.round(s.value * 100) / 100]));
   const ws = XLSX.utils.aoa_to_sheet(aoa);
+  for (const k of Object.keys(ws)) { // amounts with thousands separators (row 1 holds the year: leave it)
+    if (k[0] === "!" || ws[k].t !== "n" || XLSX.utils.decode_cell(k).r === 0) continue;
+    ws[k].z = "#,##0";
+  }
   for (const [row, c] of notes) c.det?.forEach((list, i) => {
     const cell = ws[XLSX.utils.encode_cell({ r: row, c: i + 1 })];
     if (!cell || !list.length) return;

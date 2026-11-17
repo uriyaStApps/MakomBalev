@@ -465,7 +465,11 @@ function guessType(values) {
   if (vals.every((v) => typeof v === "string" && /^\d{4}-\d\d-\d\d( \d\d:\d\d)?$/.test(v))) return "date";
   return "text";
 }
-const showValue = (v, type) => v === null || v === undefined ? "" : type === "date" && /^\d{4}-\d\d-\d\d/.test(v) ? v.slice(0, 10).split("-").reverse().join("/") + v.slice(10) : String(v);
+// amounts get thousands separators (1,234.56); numbers that are identifiers (reference, branch, account, month YYYYMM...) don't
+const ID_COL_RE = /אסמכתא|סניף|חשבון|מספר|number|^\s*id\s*$|month|חודש|שנה|year|קוד|code|טלפון|phone|ספרות/i;
+const isAmountCol = (c) => !!c && c.type === "number" && !ID_COL_RE.test(c.label);
+const showValue = (v, type, col) => v === null || v === undefined ? "" : type === "date" && /^\d{4}-\d\d-\d\d/.test(v) ? v.slice(0, 10).split("-").reverse().join("/") + v.slice(10)
+  : typeof v === "number" && isAmountCol(col) ? v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : String(v);
 function parseInput(text, type) {
   const t = text.trim();
   if (!t) return null;
@@ -899,6 +903,10 @@ function toSheet(ds, rows) {
     return v;
   }));
   const ws = XLSX.utils.aoa_to_sheet(aoa, { cellDates: true, dateNF: "dd/mm/yyyy" });
+  ds.columns.forEach((c, j) => { // amounts with thousands separators in Excel too
+    if (!isAmountCol(c)) return;
+    for (let i = 1; i < aoa.length; i++) { const cell = ws[XLSX.utils.encode_cell({ r: i, c: j })]; if (cell && cell.t === "n") cell.z = "#,##0.00"; }
+  });
   ws["!cols"] = ds.columns.map((c) => ({ wch: Math.min(40, Math.max(10, c.label.length + 2)) }));
   return ws;
 }
@@ -958,7 +966,10 @@ function filteredRows() {
   const { ds, q } = state;
   const sort = effSort();
   let rows = state.rows;
-  if (q) { const needle = q.toLowerCase(); rows = rows.filter((r) => ds.columns.some((c) => showValue(r.data[c.key], c.type).toLowerCase().includes(needle))); }
+  if (q) { // "1234" finds 1,234.00 and "1,234" too
+    const needle = q.toLowerCase(), bare = needle.replace(/,/g, "");
+    rows = rows.filter((r) => ds.columns.some((c) => { const s = showValue(r.data[c.key], c.type, c).toLowerCase(); return s.includes(needle) || (bare && s.replace(/,/g, "").includes(bare)); }));
+  }
   if (sort?.auto) {
     // empty date (e.g. a row just added) on top; same date -> later posted first
     const k = sort.key, v = (r) => r.data[k] == null || r.data[k] === "" ? null : String(r.data[k]);
@@ -1024,7 +1035,7 @@ function renderTables() {
     <div class="table-wrap"><table class="data"><thead><tr><th class="rowno">#</th>
       ${ds.columns.map((c) => `<th data-sort="${c.key}" title="לחיצה ימנית: שינוי שם עמודה">${esc(c.label)}${arrow(c.key)}</th>`).join("")}<th></th></tr></thead>
     <tbody>${rows.slice(0, state.shown).map((r, i) => `<tr data-row="${r.id}" class="${r.origin}"><td class="rowno">${i + 1}</td>
-      ${ds.columns.map((c) => `<td class="cell${c.type === "number" ? " num" : ""}" data-col="${c.key}">${state.editing?.row === r.id && state.editing.col === c.key ? "" : esc(showValue(r.data[c.key], c.type))}</td>`).join("")}
+      ${ds.columns.map((c) => `<td class="cell${c.type === "number" ? " num" : ""}" data-col="${c.key}">${state.editing?.row === r.id && state.editing.col === c.key ? "" : esc(showValue(r.data[c.key], c.type, c))}</td>`).join("")}
       <td><button class="row-del" data-del="${r.id}" title="מחיקת שורה">🗑</button></td></tr>`).join("")}</tbody></table></div>
     ${rows.length > state.shown ? `<button class="btn more" id="btn-more">הצגת עוד ${Math.min(SHOW, rows.length - state.shown)}</button>` : ""}`;
   if (state.editing) startEdit(state.editing.row, state.editing.col);
@@ -1220,6 +1231,7 @@ function matrixToExcel() {
     aoa.push([`Total ${sec.type ? sec.type.toLowerCase() : ""}`, ...sec.total.map((v) => v || null), sum(sec.total)]);
   }
   const ws = XLSX.utils.aoa_to_sheet(aoa);
+  for (const k of Object.keys(ws)) if (k[0] !== "!" && ws[k].t === "n" && XLSX.utils.decode_cell(k).r > 0) ws[k].z = "#,##0.00"; // row 1 = the year
   ws["!cols"] = [{ wch: 32 }, ...M_NAMES.map(() => ({ wch: 11 })), { wch: 12 }];
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, String(M.Y));
   XLSX.writeFile(wb, `${state.ds.name} ${M.Y}.xlsx`);
@@ -1274,7 +1286,7 @@ function startEdit(rowId, col) {
       if (error) { console.error(error); toast("השמירה נכשלה"); }
       else Object.assign(row, upd);
     }
-    td.textContent = showValue(row.data[col], c.type);
+    td.textContent = showValue(row.data[col], c.type, c);
   };
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); input.blur(); }
