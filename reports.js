@@ -7,7 +7,7 @@ const REPORTS = [
   // built from the bank + both cards (categories from Movement Mapping); the card details replace the bank's single
   // monthly card charge in every month that card has details for (otherwise the money would count twice)
   // (was "Cash Flow Outflow Uptoday", renamed 2026-11-17)
-  { id: "outflow", title: "FC Monthly", avgPage: true, sources: ["Cash Flow", "לאומי ויזה", "ל.מאסטרקארד"], defaultType: "out" },
+  { id: "outflow", title: "FC Monthly", avgPage: true, details: true, sources: ["Cash Flow", "לאומי ויזה", "ל.מאסטרקארד"], defaultType: "out" },
 ];
 // "Annual Sections Cost" (CashFlow Projection V:W). Category names are matched loosely (case, spaces, "(Test)").
 const SECTIONS = [
@@ -191,7 +191,7 @@ function buildMatrix(f, year, opening0, tl) {
     annual: { avgIn: yearOf(tin) / active, avgOut: yearOf(tout) / active, months: has.filter(Boolean).length, sections } };
 }
 
-// "Avg page" (Uriya, 2026-11-17): how many months the current bank balance covers
+// "AVG Pase" (Uriya's name for it, 2026-11-17): how many months the current bank balance covers
 // = the bank's latest balance / ((the shown year's Total Outflow - its Partisipans Paymant inflow) / 12)
 const PARTICIPANTS = ["partisipans paymant", "participants payment", "partisipants payment"];
 // The box shows the result and the month the money lasts until; double-click opens the calculation (avgPageDrill).
@@ -209,7 +209,7 @@ function avgPageCalc(f, M) {
 function avgPage(r, f, M) {
   const a = r.avgPage && avgPageCalc(f, M);
   if (!a) return "";
-  return `<span class="avg-page" dir="ltr" id="avg-page" title="Double-click: how it's calculated">Avg page <b>${a.v.toFixed(2)}</b>${a.until ? ` <span class="muted">until ${a.until}</span>` : ""}</span>`;
+  return `<span class="avg-page" dir="ltr" id="avg-page" title="Double-click: how it's calculated">AVG Pase <b>${a.v.toFixed(2)}</b>${a.until ? ` <span class="muted">until ${a.until}</span>` : ""}</span>`;
 }
 function avgPageDrill() {
   const { f, M } = rep.last, a = avgPageCalc(f, M);
@@ -225,7 +225,7 @@ function avgPageDrill() {
     dlg.addEventListener("click", (e) => { if (e.target === dlg || e.target.closest(".avg-close")) dlg.close(); });
   }
   dlg.innerHTML = `<div dir="ltr">
-    <h3>Avg page ${rep.year}: ${a.v.toFixed(2)}${a.until ? ` <span class="muted">(until ${a.until})</span>` : ""}</h3>
+    <h3>AVG Pase ${rep.year}: ${a.v.toFixed(2)}${a.until ? ` <span class="muted">(until ${a.until})</span>` : ""}</h3>
     <p class="muted formula">Current bank balance / ((Total Outflow − Partisipans Paymant) / 12)</p>
     <table class="data avg-calc"><tbody>
       ${row(`<b>Numerator</b>: current bank balance <span class="muted">(<bdi>${esc(acct)}</bdi>, ${day})</span>`, n2(a.last.close), "key")}
@@ -233,7 +233,7 @@ function avgPageDrill() {
       ${row(`− ${a.pc ? esc(a.pc.cat) : "Partisipans Paymant"} ${rep.year} <span class="muted">(inflow)</span>`, a.pc ? `−${n2(a.part)}` : "0.00 <span class=\"muted\">(none this year)</span>")}
       ${row(`= Net outflow`, n2(a.out - a.part), "sub")}
       ${row(`<b>Denominator</b>: ÷ 12 = average month`, n2(a.monthly), "key")}
-      ${row(`<b>Avg page</b> = ${n2(a.last.close)} / ${n2(a.monthly)}`, `<b>${a.v.toFixed(2)}</b>`, "total")}
+      ${row(`<b>AVG Pase</b> = ${n2(a.last.close)} / ${n2(a.monthly)}`, `<b>${a.v.toFixed(2)}</b>`, "total")}
       ${a.until ? row(`${day} + ${a.v.toFixed(2)} months`, a.until) : ""}
     </tbody></table>
     <details><summary>Total Outflow ${rep.year} by category (${outs.length})</summary>
@@ -276,10 +276,11 @@ async function renderReports() {
 
   const cells = (arr, cls = "") => arr.map((v, i) => `<td class="num ${cls}${M.has[i] ? "" : " future"}" title="${exact(v)}">${money(v)}</td>`).join("");
   const line = (label, arr, cls, total = true) => `<tr class="${cls}"><td class="lbl">${label}</td>${cells(arr)}<td class="num ytot">${total ? money(M.yearOf(arr.map((v) => v || 0))) : ""}</td></tr>`;
-  // a category's month cell: hovering it lists the transactions behind it (see showTip)
-  const tipCells = (c, type) => c.m.map((v, i) => `<td class="num${M.has[i] ? "" : " future"}${c.det[i].length ? " has-tip" : ""}"${c.det[i].length ? ` data-tip="${type}:${i}:${esc(c.cat)}"` : ` title="${exact(v)}"`}>${money(v)}</td>`).join("");
+  // FC Monthly (details): categories only, and hovering a category's month lists the transactions behind it (see showTip).
+  // Monthly I&O Cycle: no hover; a category opens into names instead.
+  const tipCells = (c, type) => !r.details ? cells(c.m) : c.m.map((v, i) => `<td class="num${M.has[i] ? "" : " future"}${c.det[i].length ? " has-tip" : ""}"${c.det[i].length ? ` data-tip="${type}:${i}:${esc(c.cat)}"` : ` title="${exact(v)}"`}>${money(v)}</td>`).join("");
   const catRows = (list, type) => list.map((c) => {
-    const key = `${type}:${c.cat}`, isOpen = rep.open.has(key), canOpen = f.hasNames && c.names.size;
+    const key = `${type}:${c.cat}`, isOpen = rep.open.has(key), canOpen = !r.details && f.hasNames && c.names.size;
     const names = isOpen ? [...c.names.entries()].sort((a, b) => M.yearOf(b[1]) - M.yearOf(a[1]))
       .map(([n, m]) => `<tr class="namerow"><td class="lbl">${esc(n)}</td>${cells(m)}<td class="num ytot">${money(M.yearOf(m))}</td></tr>`).join("") : "";
     return `<tr class="catrow${canOpen ? " drill" : ""}${c.cat === UNCAT ? " uncat" : ""}" ${canOpen ? `data-drill="${esc(key)}"` : ""}>
@@ -294,7 +295,7 @@ async function renderReports() {
         <span class="muted">${op.manual ? "(manual)" : op.value == null ? "" : "(from bank)"}</span></label>
       ${avgPage(r, f, M)}
       <span class="grow"></span>
-      ${f.hasNames ? `<button class="btn" id="rep-expand">${rep.open.size ? "Collapse all" : "Expand all"}</button>` : ""}
+      ${f.hasNames && !r.details ? `<button class="btn" id="rep-expand">${rep.open.size ? "Collapse all" : "Expand all"}</button>` : ""}
       <button class="btn" id="rep-xlsx">⬇ Excel</button>
     </div>
     ${f.swapped ? `<div class="blocked">⚠ בטבלה ${esc(f.ds.name)} יש <b>${f.swapped}</b> שורות שהתאריך שלהן נשמר הפוך (יום וחודש התחלפו, מטעינה ישנה), ולכן היתרות לפי חודש לא נכונות.
@@ -339,7 +340,7 @@ function reportToExcel() {
   const cats = (list) => list.forEach((c) => {
     notes.push([aoa.length, c]);
     push(c.cat, c.m);
-    if (f.hasNames) [...c.names.entries()].forEach(([n, m]) => push(`    ${n}`, m));
+    if (f.hasNames && !r.details) [...c.names.entries()].forEach(([n, m]) => push(`    ${n}`, m));
   });
   push("Opening bank balance", M.open, false);
   aoa.push(["Inflows"]); cats(M.ins); push("Total inflows", M.tin);
@@ -353,10 +354,10 @@ function reportToExcel() {
     if (k[0] === "!" || ws[k].t !== "n" || XLSX.utils.decode_cell(k).r === 0) continue;
     ws[k].z = "#,##0";
   }
-  for (const [row, c] of notes) c.det?.forEach((list, i) => {
+  if (r.details) for (const [row, c] of notes) c.det?.forEach((list, i) => { // cell notes: FC Monthly only
     const cell = ws[XLSX.utils.encode_cell({ r: row, c: i + 1 })];
     if (!cell || !list.length) return;
-    cell.c = [{ a: "MakomBalev", t: [...list].sort((a, b) => String(a.day ?? "").localeCompare(String(b.day ?? ""))).map((x) => `${x.label} - ${Math.round(x.amt * 100) / 100}`).join("\n") }];
+    cell.c = [{ a: "MakomBalev", t: [...list].sort((a, b) => b.amt - a.amt).map((x) => `${x.label} - ${Math.round(x.amt * 100) / 100}`).join("\n") }];
     cell.c.hidden = true;
   });
   ws["!cols"] = [{ wch: 34 }, ...MONTHS.map(() => ({ wch: 11 })), { wch: 12 }];
@@ -389,13 +390,13 @@ function showTip(td) {
   const cat = rest.join(":"), M = rep.last?.M;
   const c = M && (type === "in" ? M.ins : M.outs).find((x) => x.cat === cat);
   if (!c) return hideTip();
-  const list = [...c.det[+i]].sort((a, b) => String(a.day ?? "").localeCompare(String(b.day ?? "")) || b.amt - a.amt);
+  const list = [...c.det[+i]].sort((a, b) => b.amt - a.amt); // biggest first, no dates
   const MAX = 25;
   const fmt = (n) => n.toLocaleString("en-US", { maximumFractionDigits: 2 });
   let tip = $("rep-tip");
   if (!tip) { tip = document.createElement("div"); tip.id = "rep-tip"; tip.className = "rep-tip"; document.body.appendChild(tip); }
   tip.innerHTML = `<div class="tip-head">${esc(cat)} · ${MONTHS[+i]} ${esc(rep.year)} · <span dir="ltr">${fmt(c.m[+i])}</span></div>`
-    + list.slice(0, MAX).map((x) => `<div class="tip-line"><span class="tip-day">${x.day ? esc(String(x.day).slice(0, 10).split("-").reverse().slice(0, 2).join("/")) : ""}</span><span class="tip-name">${esc(x.label)}</span><span class="tip-amt" dir="ltr">${fmt(x.amt)}</span></div>`).join("")
+    + list.slice(0, MAX).map((x) => `<div class="tip-line"><span class="tip-name">${esc(x.label)}</span><span class="tip-amt" dir="ltr">${fmt(x.amt)}</span></div>`).join("")
     + (list.length > MAX ? `<div class="muted">ועוד ${list.length - MAX} תנועות</div>` : "");
   tip.hidden = false;
   const r = td.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
