@@ -13,8 +13,24 @@ const TOPICS = [
   // the bank shows one total charge per card; the card files hold the details -> separate tables, never mixed into Cash Flow
   { id: "visa", label: "טעינת לאומי ויזה", table: "לאומי ויזה", derive: deriveCashFlow, kind: "card" },
   { id: "mastercard", label: "טעינת ל.מאסטרקארד", table: "ל.מאסטרקארד", derive: deriveCashFlow, kind: "card" },
-  { id: "outflow", label: "טעינת cash flow outflow uptoday", table: "Cash Flow Outflow Uptoday", derive: deriveCashFlow },
 ];
+// Until 2026-11-17 "Cash Flow Outflow Uptoday" was a table loaded from the Excel. Now its report is built from the bank +
+// card tables through Movement Mapping, and the table is deleted (once, by an admin, after a confirm).
+const RETIRED_TABLE = "Cash Flow Outflow Uptoday";
+async function retireOutflowTable() {
+  const ds = state.datasets.find((d) => d.name === RETIRED_TABLE);
+  if (!ds || !isAdmin) return;
+  try { if (localStorage.getItem("mb_keep_outflow_table")) return; } catch {}
+  const n = state.counts[ds.id] ?? 0;
+  if (!confirm(`הדוח Cash Flow Outflow Uptoday נבנה עכשיו מחשבון הבנק ומשני הכרטיסים (לפי Movement Mapping).\n\nלמחוק את הטבלה "${RETIRED_TABLE}" (${n} שורות)? אין דרך חזרה.\n(ביטול = להשאיר אותה, בלי לשאול שוב)`)) {
+    try { localStorage.setItem("mb_keep_outflow_table", "1"); } catch {}
+    return;
+  }
+  const { error } = await sb.from("datasets").delete().eq("id", ds.id);
+  if (error) { console.error(error); return toast("מחיקת הטבלה נכשלה"); }
+  await loadDatasets();
+  toast(`הטבלה "${RETIRED_TABLE}" נמחקה`);
+}
 // The Category Mapping table (was "Categories" until 2026-11-17) is not uploaded: the site creates it once with this
 // list, then it's edited on the site (add a row, ⬇ Excel to download). "type" is a dropdown.
 const CATEGORIES_TABLE = "Category Mapping", OLD_CATEGORIES_TABLE = "Categories";
@@ -118,7 +134,8 @@ const isOldCategoryCol = (c) => c.label === CATEGORY_COL.label && c.manual;
 // One row per distinct description in each account table: the bank's "תיאור תנועה", a card's business name.
 // The category is chosen here once, instead of on every transaction; the reports read it from here.
 const MOVEMENT_TABLE = "Movement Mapping";
-const MM = { acc: "c1", desc: "c2", cat: "c3", prev: "c4" };
+// (lastAmt / lastDate keys aren't cN, so a column added on the site ("+ עמודה" -> next cN) can't collide with them)
+const MM = { acc: "c1", desc: "c2", cat: "c3", prev: "c4", lastAmt: "last_amt", lastDate: "last_date" };
 const descKey = (v) => (v == null ? "" : String(v).replace(/\s+/g, " ").trim());
 // the column of an account table that names the movement
 function movementCol(ds) {
@@ -163,42 +180,61 @@ async function syncMovementMapping(carry = false) {
   const existing = await loadRows(ds.id);
   const have = new Map(existing.map((r) => [`${topicOfAccount(r.data[MM.acc])?.table}|${descKey(r.data[MM.desc])}`, r]));
   const add = [], fill = [];
-  let mixed = 0;
+  let mixed = 0, filled = 0;
   for (const tp of accountTopics()) {
     const src = state.datasets.find((d) => d.name === tp.table);
     const col = src && movementCol(src);
     if (!col) continue;
     const old = carry ? src.columns.find(isOldCategoryCol) : null;
-    const seen = new Map(); // description -> { category -> count }
+    const dateCol = src.columns.find((c) => c.type === "date");
+    const seen = new Map(); // description -> { counts: {category -> n}, last: the latest row }
     for (const r of await loadRows(src.id)) {
       const d = descKey(r.data[col.key]);
       if (!d) continue;
-      if (!seen.has(d)) seen.set(d, {});
+      if (!seen.has(d)) seen.set(d, { counts: {}, last: null });
+      const s = seen.get(d);
       const c = old ? descKey(r.data[old.key]) : "";
-      if (c) seen.get(d)[c] = (seen.get(d)[c] || 0) + 1;
+      if (c) s.counts[c] = (s.counts[c] || 0) + 1;
+      const day = (x) => String((dateCol && x.data[dateCol.key]) ?? "");
+      if (!s.last || day(r) > day(s.last) || (day(r) === day(s.last) && r.id > s.last.id)) s.last = r;
     }
-    for (const [d, counts] of seen) {
+    for (const [d, { counts, last }] of seen) {
       const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-      const data = { [MM.acc]: accountOf(tp).name, [MM.desc]: d };
+      const lastVals = { [MM.lastAmt]: movementAmount(src, last.data), [MM.lastDate]: (dateCol && last.data[dateCol.key]) ?? null };
+      const data = { [MM.acc]: accountOf(tp).name, [MM.desc]: d, ...lastVals };
       if (ranked.length) data[MM.cat] = ranked[0][0];
       if (ranked.length > 1) { data[MM.prev] = ranked.map(([c, n]) => `${c} ×${n}`).join(" · "); mixed++; }
       const row = have.get(`${tp.table}|${d}`);
-      if (!row) add.push(data);
-      else if (ranked.length && (row.data[MM.cat] == null || row.data[MM.cat] === "")) fill.push({ row, data: { ...row.data, ...data } });
+      if (!row) { add.push(data); continue; }
+      const next = { ...row.data, ...lastVals };
+      if (ranked.length && (row.data[MM.cat] == null || row.data[MM.cat] === "")) { Object.assign(next, data); filled++; }
+      if (JSON.stringify(next) !== JSON.stringify(row.data)) fill.push({ row, data: next });
     }
   }
-  if ([...add, ...fill.map((f) => f.data)].some((d) => d[MM.prev] != null) && !ds.columns.some((c) => c.key === MM.prev)) {
-    const columns = [...ds.columns, { key: MM.prev, label: "קטגוריות קודמות", type: "text" }];
-    const { error } = await sb.from("datasets").update({ columns }).eq("id", ds.id);
+  // columns: the last movement's amount + date sit next to the description (they help recognise it)
+  const want = [...ds.columns];
+  const put = (col, after) => { if (want.some((c) => c.key === col.key)) return; want.splice(want.findIndex((c) => c.key === after) + 1, 0, col); };
+  put({ key: MM.lastAmt, label: "סכום תנועה אחרון", type: "number" }, MM.desc);
+  put({ key: MM.lastDate, label: "תאריך תנועה אחרונה", type: "date" }, MM.lastAmt);
+  if ([...add, ...fill.map((f) => f.data)].some((d) => d[MM.prev] != null)) put({ key: MM.prev, label: "קטגוריות קודמות", type: "text" }, want[want.length - 1].key);
+  if (want.length !== ds.columns.length) {
+    const { error } = await sb.from("datasets").update({ columns: want }).eq("id", ds.id);
     if (error) throw error;
-    ds.columns = columns;
+    ds.columns = want;
   }
   if (add.length) await insertRows(ds.id, add, "site");
-  for (const f of fill) {
-    const { error } = await sb.from("dataset_rows").update({ data: f.data }).eq("id", f.row.id);
-    if (error) throw error;
+  for (let i = 0; i < fill.length; i += 20) { // a few at a time: the first run updates every row
+    const res = await Promise.all(fill.slice(i, i + 20).map((f) => sb.from("dataset_rows").update({ data: f.data }).eq("id", f.row.id)));
+    const bad = res.find((x) => x.error); if (bad) throw bad.error;
   }
-  return { added: add.length, carried: add.filter((d) => d[MM.cat]).length + fill.length, mixed };
+  return { added: add.length, carried: add.filter((d) => d[MM.cat]).length + filled, mixed };
+}
+// a movement's amount, signed: bank = credit (+) / debit (-), card = the charged amount
+function movementAmount(ds, d) {
+  const cols = ds.columns, num = (c) => (c ? Number(d[c.key]) || 0 : 0);
+  if (topicOf(ds)?.kind === "bank") return Math.round((num(cols.find((c) => /זכות|credit/i.test(c.label))) - num(cols.find((c) => /חובה|debit/i.test(c.label)))) * 100) / 100;
+  const amt = cols.find((c) => /סכום\s*ה?חיוב|charge/i.test(c.label)) || cols.find((c) => /סכום|amount/i.test(c.label) && c.type === "number");
+  return amt ? num(amt) : null;
 }
 // one-time move: per-row Category in the bank/card tables -> Movement Mapping, then the column is taken off those tables
 // (the old values stay inside the rows' data, just not shown). Runs again only if a table still has the column.
@@ -1472,6 +1508,7 @@ async function start() {
     await loadAccounts();
     let moved = null;
     try { moved = await ensureMovementMapping(); } catch (e) { console.error(e); toast("המעבר ל-Movement Mapping נכשל, נסו לרענן", 6000); }
+    await retireOutflowTable();
     $("status").textContent = "";
     render();
     if (moved) toast(`נוצרה הטבלה ${MOVEMENT_TABLE}: ${moved.added} תיאורי תנועה, ${moved.carried} עם קטגוריה מהטבלאות${moved.mixed ? `, ב-${moved.mixed} היו כמה קטגוריות שונות (נבחרה הנפוצה, השאר בעמודה "קטגוריות קודמות")` : ""}.`, 12000);

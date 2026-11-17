@@ -4,7 +4,9 @@
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const REPORTS = [
   { id: "cashflow", title: "Monthly I&O Cycle", table: "Cash Flow", defaultType: "out" }, // report renamed 2026-11-17; the table stays "Cash Flow"
-  { id: "outflow", title: "Cash Flow Outflow Uptoday", table: "Cash Flow Outflow Uptoday", defaultType: "out" },
+  // built from the bank + both cards (categories from Movement Mapping); the card details replace the bank's single
+  // monthly card charge in every month that card has details for (otherwise the money would count twice)
+  { id: "outflow", title: "Cash Flow Outflow Uptoday", sources: ["Cash Flow", "לאומי ויזה", "ל.מאסטרקארד"], defaultType: "out" },
 ];
 // "Annual Sections Cost" (CashFlow Projection V:W). Category names are matched loosely (case, spaces, "(Test)").
 const SECTIONS = [
@@ -73,44 +75,68 @@ function openingAt(tl, ym) {
   return closingAt(tl, prevYM(ym)) ?? tl.find((p) => p.day >= `${ym}-01`)?.open ?? null;
 }
 
-// table -> facts [{ym, cat, type, amt, name}] + optional balance timeline
+// a report -> facts [{ym, cat, type, amt, name, det}] + optional balance timeline.
+// det = one transaction behind the number ({day, label, amt}), shown when hovering a cell.
 async function loadFacts(r) {
-  const ds = state.datasets.find((d) => d.name === r.table);
-  if (!ds) return { error: `הטבלה "${r.table}" עדיין לא נטענה. טענו אותה מלשונית הטבלאות.` };
+  const names = r.sources || [r.table];
+  const dss = names.map((n) => state.datasets.find((d) => d.name === n));
+  if (!dss[0]) return { error: `הטבלה "${names[0]}" עדיין לא נטענה. טענו אותה מלשונית הטבלאות.` };
+  const [cats, mmap] = await Promise.all([loadCategoryInfo(), loadMovementMap()]);
+  const parts = await Promise.all(dss.map((ds) => (ds ? tableFacts(r, ds, cats, mmap) : null)));
+  const main = parts[0];
+  if (!r.sources) return { ...main, cats };
+  // card details replace the bank's charge line for that card, month by month (only where the card has details)
+  const cardMonths = new Map(parts.slice(1).filter(Boolean).map((p) => [p.ds.name, new Set(p.facts.map((x) => x.ym))]));
+  const facts = [
+    ...main.facts.filter((x) => !(x.card && cardMonths.get(x.card)?.has(x.ym))),
+    ...parts.slice(1).filter(Boolean).flatMap((p) => p.facts),
+  ];
+  return { ...main, facts, cats, hasNames: parts.some((p) => p?.hasNames), merged: true,
+    missing: names.filter((n, i) => !dss[i]) };
+}
+async function tableFacts(r, ds, cats, mmap) {
+  const rows = await loadRows(ds.id);
   const acct = topicOf(ds)?.kind; // bank / card table: the category comes from Movement Mapping by the movement's description
-  const [rows, cats, mmap] = await Promise.all([loadRows(ds.id), loadCategoryInfo(), acct ? loadMovementMap() : null]);
   const cols = ds.columns;
   const moveCol = acct ? movementCol(ds) : null, moveCats = mmap?.get(ds.name) || new Map();
   const catCol = acct ? null : cols.find((c) => CAT_RE.test(c.label));
-  const monthCol = cols.find((c) => /^\s*month\s*$|חודש/i.test(c.label));
-  const amountCol = cols.find((c) => /amount|סכום/i.test(c.label));
-  const typeCol = cols.find((c) => /^\s*type\s*$|סוג/i.test(c.label));
+  const monthCol = acct === "card" ? periodCol(cols) : cols.find((c) => /^\s*month\s*$|חודש/i.test(c.label)); // card: the statement month
+  const amountCol = acct === "card" ? cols.find((c) => /סכום\s*ה?חיוב|charge/i.test(c.label)) || cols.find((c) => /סכום|amount/i.test(c.label) && c.type === "number")
+    : cols.find((c) => /amount|סכום/i.test(c.label));
+  const typeCol = acct ? null : cols.find((c) => /^\s*type\s*$|סוג/i.test(c.label));
   const dateCol = cols.find((c) => c.type === "date");
   const debit = cols.find((c) => /חובה|debit/i.test(c.label));
   const credit = cols.find((c) => /זכות|credit/i.test(c.label));
   const balCol = cols.find((c) => /יתרה|balance/i.test(c.label) && c.type === "number");
   const nameCol = cols.find((c) => c.label === NAME_LABEL);
   const catName = (v) => (v == null || v === "" ? UNCAT : cats.get(norm(v))?.name || String(v).trim());
+  // bank lines that are a card's monthly charge ("לאומי ויזה", "ל.מאסטרקארד")
+  const cardOf = (desc) => acct === "bank" ? accountTopics().find((tp) => tp.kind === "card" && (descKey(desc) === tp.table || descKey(desc) === accountOf(tp).name))?.table : null;
   const facts = [];
-  const add = (ym, cat, type, amt, name) => { if (ym && amt) facts.push({ ym, cat, type, amt, name }); };
   for (const row of rows) {
     const d = row.data;
-    const cat = catName(acct ? moveCol && moveCats.get(descKey(d[moveCol.key])) : catCol && d[catCol.key]);
+    const desc = moveCol ? d[moveCol.key] : null;
+    const cat = catName(acct ? moveCol && moveCats.get(descKey(desc)) : catCol && d[catCol.key]);
     const name = nameCol ? d[nameCol.key] ?? NONAME : null;
     const ym = toYM(monthCol ? d[monthCol.key] : dateCol && d[dateCol.key]);
+    const label = [name !== NONAME && name, desc != null && descKey(desc) !== descKey(name) && desc].filter(Boolean).join(" · ") || NONAME;
+    const card = cardOf(desc);
+    const add = (type, amt) => { if (ym && amt) facts.push({ ym, cat, type, amt, name, card, det: { day: dateCol ? d[dateCol.key] : null, label, amt } }); };
     if (debit || credit) { // bank style: separate debit / credit columns
-      add(ym, cat, "in", Number(credit && d[credit.key]) || 0, name);
-      add(ym, cat, "out", Number(debit && d[debit.key]) || 0, name);
+      add("in", Number(credit && d[credit.key]) || 0);
+      add("out", Number(debit && d[debit.key]) || 0);
+    } else if (acct === "card") { // card: an outflow; a refund (negative) lowers its category
+      add("out", Number(amountCol && d[amountCol.key]) || 0);
     } else if (amountCol) { // one amount column: the type comes from the row, else the Categories table, else the report default
       let amt = Number(d[amountCol.key]) || 0;
       let type = (typeCol && typeOf(d[typeCol.key])) || cats.get(norm(d[catCol?.key]))?.type || r.defaultType;
       if (amt < 0) { amt = -amt; type = type === "in" ? "out" : "in"; }
-      add(ym, cat, type, amt, name);
+      add(type, amt);
     }
   }
   const tl = dateCol && balCol ? balanceTimeline(ds, rows, dateCol, balCol, debit, credit) : null;
   const swapped = balCol ? findSwappedDates(ds, rows).length : 0; // dates stored with day/month swapped (old XLS reads)
-  return { facts, cats, tl, hasNames: !!nameCol, rows: rows.length, swapped, ds, mapped: !!acct };
+  return { facts, tl, hasNames: !!nameCol, rows: rows.length, swapped, ds, mapped: !!acct };
 }
 
 // facts for one year -> matrix
@@ -121,8 +147,9 @@ function buildMatrix(f, year, opening0, tl) {
   for (const x of f.facts) {
     const i = yms.indexOf(x.ym); if (i < 0) continue;
     const g = sec[x.type];
-    if (!g.has(x.cat)) g.set(x.cat, { cat: x.cat, m: blank(), names: new Map() });
+    if (!g.has(x.cat)) g.set(x.cat, { cat: x.cat, m: blank(), names: new Map(), det: Array.from({ length: 12 }, () => []) });
     const c = g.get(x.cat); c.m[i] += x.amt;
+    if (x.det) c.det[i].push(x.det);
     if (x.name != null) { if (!c.names.has(x.name)) c.names.set(x.name, blank()); c.names.get(x.name)[i] += x.amt; }
   }
   const order = (a, b) => (a.cat === UNCAT) - (b.cat === UNCAT) || (f.cats.get(norm(a.cat))?.order ?? 1e9) - (f.cats.get(norm(b.cat))?.order ?? 1e9) || a.cat.localeCompare(b.cat);
@@ -141,7 +168,8 @@ function buildMatrix(f, year, opening0, tl) {
     open[i] = i === 0 && opening0 != null ? opening0 : bo ?? (i > 0 ? close[i - 1] : opening0);
     if (open[i] == null) continue;
     close[i] = bc ?? open[i] + net[i];
-    if (f.tl && bo != null && bc != null && Math.abs(bo + net[i] - bc) > 0.5) mismatch.push({ i, diff: bc - (bo + net[i]) });
+    // (not for the merged report: card details are booked by statement month, the bank charge may fall in another)
+    if (f.tl && !f.merged && bo != null && bc != null && Math.abs(bo + net[i] - bc) > 0.5) mismatch.push({ i, diff: bc - (bo + net[i]) });
   }
   // a posting dated in one month but booked in the next shows as +x / -x in two months: that's timing, not missing rows
   if (Math.abs(mismatch.reduce((s, x) => s + x.diff, 0)) <= 0.5) mismatch.length = 0;
@@ -176,7 +204,6 @@ async function renderReports() {
   if (!rep.cache[r.id]) {
     el.innerHTML = head + `<p class="muted">טוען…</p>`;
     try {
-      if (r.id !== "cashflow" && !rep.cache.cashflow && state.datasets.some((d) => d.name === "Cash Flow")) rep.cache.cashflow = await loadFacts(REPORTS[0]);
       rep.cache[r.id] = await loadFacts(r);
     } catch (err) { console.error(err); el.innerHTML = head + `<p class="warn">שגיאה בטעינת הדוח</p>`; return; }
   }
@@ -192,12 +219,14 @@ async function renderReports() {
 
   const cells = (arr, cls = "") => arr.map((v, i) => `<td class="num ${cls}${M.has[i] ? "" : " future"}" title="${exact(v)}">${money(v)}</td>`).join("");
   const line = (label, arr, cls, total = true) => `<tr class="${cls}"><td class="lbl">${label}</td>${cells(arr)}<td class="num ytot">${total ? money(M.yearOf(arr.map((v) => v || 0))) : ""}</td></tr>`;
+  // a category's month cell: hovering it lists the transactions behind it (see showTip)
+  const tipCells = (c, type) => c.m.map((v, i) => `<td class="num${M.has[i] ? "" : " future"}${c.det[i].length ? " has-tip" : ""}"${c.det[i].length ? ` data-tip="${type}:${i}:${esc(c.cat)}"` : ` title="${exact(v)}"`}>${money(v)}</td>`).join("");
   const catRows = (list, type) => list.map((c) => {
     const key = `${type}:${c.cat}`, isOpen = rep.open.has(key), canOpen = f.hasNames && c.names.size;
     const names = isOpen ? [...c.names.entries()].sort((a, b) => M.yearOf(b[1]) - M.yearOf(a[1]))
       .map(([n, m]) => `<tr class="namerow"><td class="lbl">${esc(n)}</td>${cells(m)}<td class="num ytot">${money(M.yearOf(m))}</td></tr>`).join("") : "";
     return `<tr class="catrow${canOpen ? " drill" : ""}${c.cat === UNCAT ? " uncat" : ""}" ${canOpen ? `data-drill="${esc(key)}"` : ""}>
-      <td class="lbl">${canOpen ? (isOpen ? "▾ " : "▸ ") : ""}${esc(c.cat)}</td>${cells(c.m)}<td class="num ytot">${money(M.yearOf(c.m))}</td></tr>${names}`;
+      <td class="lbl">${canOpen ? (isOpen ? "▾ " : "▸ ") : ""}${esc(c.cat)}</td>${tipCells(c, type)}<td class="num ytot">${money(M.yearOf(c.m))}</td></tr>${names}`;
   }).join("");
   const balRow = (label, arr) => `<tr class="bal"><td class="lbl">${label}</td>${arr.map((v, i) => `<td class="num" title="${exact(v)}">${v == null ? "" : Math.round(v).toLocaleString("en-US")}</td>`).join("")}<td></td></tr>`;
 
@@ -214,6 +243,7 @@ async function renderReports() {
       <button class="btn primary" id="rep-fix-dates">🛠 תיקון התאריכים</button></div>` : ""}
     ${M.mismatch.length ? `<p class="warn">⚠ בחודשים ${M.mismatch.map((x) => `${MONTHS[x.i]} (הפרש ${money(x.diff)})`).join(", ")} התנועות בטבלה לא מסתכמות ליתרה של הבנק. ייתכן שיש שורות כפולות או חסרות (למשל קובץ שנטען פעמיים עם "הוספה בלבד"). היתרות בדוח לקוחות מהבנק עצמו.</p>` : ""}
     ${uncats ? `<p class="warn">⚠ ${money(uncats)} ₪ בשנה הזאת בלי Category (שורת Uncategorized). אפשר לסווג אותן בטבלה ${esc(f.mapped ? MOVEMENT_TABLE : r.table)}${f.mapped ? " (קטגוריה לכל תאור תנועה)" : ""}.</p>` : ""}
+    ${f.merged ? `<p class="muted">מקור: ${r.sources.map((n) => esc(n === "Cash Flow" ? accountOf(TOPICS.find((t) => t.table === n)).name : n)).join(" + ")}. פירוט הכרטיס מחליף את שורת החיוב של הכרטיס בבנק בכל חודש שיש לכרטיס פירוט, והוא נספר לפי תקופת החיוב.${f.missing.length ? ` עדיין לא נטען: ${f.missing.map(esc).join(", ")}.` : ""} ריחוף מעל תא מציג את התנועות שלו.</p>` : ""}
     <div class="report-grid" dir="ltr">
       <div class="table-wrap"><table class="data report"><thead><tr><th class="lbl">Category</th>${MONTHS.map((m) => `<th>${m}</th>`).join("")}<th>Total</th></tr></thead><tbody>
         ${balRow("Opening bank balance", M.open)}
@@ -247,7 +277,9 @@ function reportToExcel() {
   const aoa = [[r.title, rep.year], [], ["Category", ...MONTHS, "Total"]];
   const nums = (arr) => arr.map((v) => (v == null || v === 0 ? null : Math.round(v * 100) / 100));
   const push = (label, arr, total = true) => aoa.push([label, ...nums(arr), total ? Math.round(M.yearOf(arr.map((v) => v || 0)) * 100) / 100 : null]);
+  const notes = []; // [row, category] -> each month cell gets a note listing its transactions (like the hover)
   const cats = (list) => list.forEach((c) => {
+    notes.push([aoa.length, c]);
     push(c.cat, c.m);
     if (f.hasNames) [...c.names.entries()].forEach(([n, m]) => push(`    ${n}`, m));
   });
@@ -259,6 +291,12 @@ function reportToExcel() {
   aoa.push(["Total Outflow", Math.round(M.yearOf(M.tout) * 100) / 100], [], ["Annual Sections Cost"]);
   M.annual.sections.forEach((s) => aoa.push([s.label, Math.round(s.value * 100) / 100]));
   const ws = XLSX.utils.aoa_to_sheet(aoa);
+  for (const [row, c] of notes) c.det?.forEach((list, i) => {
+    const cell = ws[XLSX.utils.encode_cell({ r: row, c: i + 1 })];
+    if (!cell || !list.length) return;
+    cell.c = [{ a: "MakomBalev", t: [...list].sort((a, b) => String(a.day ?? "").localeCompare(String(b.day ?? ""))).map((x) => `${x.label} - ${Math.round(x.amt * 100) / 100}`).join("\n") }];
+    cell.c.hidden = true;
+  });
   ws["!cols"] = [{ wch: 34 }, ...MONTHS.map(() => ({ wch: 11 })), { wch: 12 }];
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, r.title.slice(0, 31));
   XLSX.writeFile(wb, `${r.title} ${rep.year}.xlsx`);
@@ -283,6 +321,30 @@ $("view-reports").addEventListener("click", (e) => {
     return fixSwappedDates(f.ds).then((n) => { toast(`תוקנו ${n} שורות`); rep.cache = {}; renderReports(); });
   }
 });
+// hover a category's month: the transactions behind the number (like the cell notes in the Excel)
+function showTip(td) {
+  const [type, i, ...rest] = td.dataset.tip.split(":");
+  const cat = rest.join(":"), M = rep.last?.M;
+  const c = M && (type === "in" ? M.ins : M.outs).find((x) => x.cat === cat);
+  if (!c) return hideTip();
+  const list = [...c.det[+i]].sort((a, b) => String(a.day ?? "").localeCompare(String(b.day ?? "")) || b.amt - a.amt);
+  const MAX = 25;
+  const fmt = (n) => n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  let tip = $("rep-tip");
+  if (!tip) { tip = document.createElement("div"); tip.id = "rep-tip"; tip.className = "rep-tip"; document.body.appendChild(tip); }
+  tip.innerHTML = `<div class="tip-head">${esc(cat)} · ${MONTHS[+i]} ${esc(rep.year)} · <span dir="ltr">${fmt(c.m[+i])}</span></div>`
+    + list.slice(0, MAX).map((x) => `<div class="tip-line"><span class="tip-day">${x.day ? esc(String(x.day).slice(0, 10).split("-").reverse().slice(0, 2).join("/")) : ""}</span><span class="tip-name">${esc(x.label)}</span><span class="tip-amt" dir="ltr">${fmt(x.amt)}</span></div>`).join("")
+    + (list.length > MAX ? `<div class="muted">ועוד ${list.length - MAX} תנועות</div>` : "");
+  tip.hidden = false;
+  const r = td.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
+  const left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), innerWidth - w - 8);
+  const top = r.bottom + 6 + h > innerHeight ? Math.max(8, r.top - h - 6) : r.bottom + 6;
+  tip.style.left = `${left}px`; tip.style.top = `${top}px`;
+}
+function hideTip() { const t = $("rep-tip"); if (t) t.hidden = true; }
+$("view-reports").addEventListener("mouseover", (e) => { const td = e.target.closest("td[data-tip]"); td ? showTip(td) : hideTip(); });
+$("view-reports").addEventListener("mouseleave", hideTip);
+window.addEventListener("scroll", hideTip, true);
 $("view-reports").addEventListener("change", (e) => {
   if (e.target.id === "rep-year") { rep.year = e.target.value; return renderReports(); }
   if (e.target.id === "rep-open") {
