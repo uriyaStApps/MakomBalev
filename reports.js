@@ -3,7 +3,7 @@
 //  - Cash Flow Outflow Uptoday: rows of category / month / type / amount -> the same matrix + the sheet's R:X annual panel
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const REPORTS = [
-  { id: "cashflow", title: "Cash Flow", table: "Cash Flow", defaultType: "out" },
+  { id: "cashflow", title: "Monthly I&O Cycle", table: "Cash Flow", defaultType: "out" }, // report renamed 2026-11-17; the table stays "Cash Flow"
   { id: "outflow", title: "Cash Flow Outflow Uptoday", table: "Cash Flow Outflow Uptoday", defaultType: "out" },
 ];
 // "Annual Sections Cost" (CashFlow Projection V:W). Category names are matched loosely (case, spaces, "(Test)").
