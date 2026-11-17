@@ -15,9 +15,9 @@ const TOPICS = [
   { id: "mastercard", label: "טעינת ל.מאסטרקארד", table: "ל.מאסטרקארד", derive: deriveCashFlow, kind: "card" },
   { id: "outflow", label: "טעינת cash flow outflow uptoday", table: "Cash Flow Outflow Uptoday", derive: deriveCashFlow },
 ];
-// The Categories table is not uploaded: the site creates it once with this list, then it's edited on the site
-// (add a row, ⬇ Excel to download). "type" is a dropdown.
-const CATEGORIES_TABLE = "Categories";
+// The Category Mapping table (was "Categories" until 2026-11-17) is not uploaded: the site creates it once with this
+// list, then it's edited on the site (add a row, ⬇ Excel to download). "type" is a dropdown.
+const CATEGORIES_TABLE = "Category Mapping", OLD_CATEGORIES_TABLE = "Categories";
 const CATEGORY_TYPES = ["Inflows", "Outflows"];
 const DEFAULT_CATEGORIES = [
   ["Partisipans Paymant", "Inflows"], ["Bituach Leumi", "Inflows"], ["Donations", "Inflows"], ["Other", "Inflows"],
@@ -80,6 +80,18 @@ function detectNumber(t, kind) {
 const sameNumber = (kind, a, b) => kind === "card" ? digits(a).slice(-4) === digits(b).slice(-4) : digits(a) === digits(b);
 const numberLabel = (kind, n) => (kind === "card" ? `כרטיס המסתיים ב-${digits(n).slice(-4)}` : `חשבון ${n}`);
 async function ensureCategories() {
+  // renamed "Categories" -> "Category Mapping": rename the table in place and point every dropdown at the new name
+  const old = state.datasets.find((d) => d.name === OLD_CATEGORIES_TABLE);
+  if (old && !state.datasets.some((d) => d.name === CATEGORIES_TABLE)) {
+    const { error } = await sb.from("datasets").update({ name: CATEGORIES_TABLE }).eq("id", old.id);
+    if (error) console.error(error); else old.name = CATEGORIES_TABLE;
+  }
+  for (const d of state.datasets) {
+    if (!d.columns.some((c) => c.lookup === OLD_CATEGORIES_TABLE)) continue;
+    const columns = d.columns.map((c) => (c.lookup === OLD_CATEGORIES_TABLE ? { ...c, lookup: CATEGORIES_TABLE } : c));
+    const { error } = await sb.from("datasets").update({ columns }).eq("id", d.id);
+    if (error) console.error(error); else d.columns = columns;
+  }
   const existing = state.datasets.find((d) => d.name === CATEGORIES_TABLE);
   if (existing) { // loaded earlier from a file: just make "type" a dropdown
     const typeCol = existing.columns.find((c) => /^\s*type\s*$/i.test(c.label));
@@ -97,8 +109,112 @@ async function ensureCategories() {
   if (e2) console.error(e2);
   await loadDatasets();
 }
-// Cash Flow's "Category" is chosen by hand from the Categories table (manual = kept when the period is reloaded)
-const CATEGORY_COL = { label: "Category", type: "text", lookup: "Categories", manual: true };
+// Until 2026-11-17 the bank/card tables had a hand-picked "Category" column (manual = kept when the period is reloaded).
+// It moved to Movement Mapping; this describes the old column so the migration can find it.
+const CATEGORY_COL = { label: "Category", type: "text", lookup: CATEGORIES_TABLE, manual: true };
+const isOldCategoryCol = (c) => c.label === CATEGORY_COL.label && c.manual;
+
+// ---------------- Movement Mapping: (account, movement description) -> category ----------------
+// One row per distinct description in each account table: the bank's "תיאור תנועה", a card's business name.
+// The category is chosen here once, instead of on every transaction; the reports read it from here.
+const MOVEMENT_TABLE = "Movement Mapping";
+const MM = { acc: "c1", desc: "c2", cat: "c3", prev: "c4" };
+const descKey = (v) => (v == null ? "" : String(v).replace(/\s+/g, " ").trim());
+// the column of an account table that names the movement
+function movementCol(ds) {
+  const tp = topicOf(ds);
+  if (!tp?.kind) return null;
+  if (tp.kind === "bank") return ds.columns.find((c) => /^\s*תי?אור\s*ה?תנועה\s*$/.test(c.label)) || null;
+  return ds.columns.find((c) => /בית\s*ה?עסק|merchant|שם\s*ה?עסק/i.test(c.label)) || ds.columns.find((c) => c.label === NAME_LABEL) || null;
+}
+const accountTopics = () => TOPICS.filter((tp) => tp.kind);
+// Movement Mapping's account cell (the account's name, or its table name) -> topic
+const topicOfAccount = (v) => accountTopics().find((tp) => tp.table === descKey(v) || accountOf(tp).name === descKey(v));
+async function createMovementMapping() {
+  const columns = [
+    { key: MM.acc, label: "חשבון", type: "text", options: accountTopics().map((tp) => accountOf(tp).name) },
+    { key: MM.desc, label: "תאור תנועה", type: "text" },
+    { key: MM.cat, label: "קטגוריה", type: "text", lookup: CATEGORIES_TABLE },
+  ];
+  const { data, error } = await sb.from("datasets").insert({ name: MOVEMENT_TABLE, columns, source_file: null }).select().single();
+  if (error && error.code !== "23505") throw error; // 23505: another user just created it
+  await loadDatasets();
+  return data || state.datasets.find((d) => d.name === MOVEMENT_TABLE);
+}
+// { table -> Map(description -> category) }
+async function loadMovementMap() {
+  const ds = state.datasets.find((d) => d.name === MOVEMENT_TABLE);
+  const map = new Map();
+  if (!ds) return map;
+  for (const r of await loadRows(ds.id)) {
+    const tp = topicOfAccount(r.data[MM.acc]);
+    if (!tp) continue;
+    if (!map.has(tp.table)) map.set(tp.table, new Map());
+    const cat = r.data[MM.cat];
+    if (cat != null && cat !== "") map.get(tp.table).set(descKey(r.data[MM.desc]), cat);
+  }
+  return map;
+}
+// adds every (account, description) that isn't in Movement Mapping yet. carry = also take the category from the old
+// per-row "Category" column (the most common one for that description; when the rows disagree, the others are listed
+// in a "קטגוריות קודמות" column so they can be checked). Returns { added, carried, mixed }.
+async function syncMovementMapping(carry = false) {
+  let ds = state.datasets.find((d) => d.name === MOVEMENT_TABLE) || await createMovementMapping();
+  const existing = await loadRows(ds.id);
+  const have = new Map(existing.map((r) => [`${topicOfAccount(r.data[MM.acc])?.table}|${descKey(r.data[MM.desc])}`, r]));
+  const add = [], fill = [];
+  let mixed = 0;
+  for (const tp of accountTopics()) {
+    const src = state.datasets.find((d) => d.name === tp.table);
+    const col = src && movementCol(src);
+    if (!col) continue;
+    const old = carry ? src.columns.find(isOldCategoryCol) : null;
+    const seen = new Map(); // description -> { category -> count }
+    for (const r of await loadRows(src.id)) {
+      const d = descKey(r.data[col.key]);
+      if (!d) continue;
+      if (!seen.has(d)) seen.set(d, {});
+      const c = old ? descKey(r.data[old.key]) : "";
+      if (c) seen.get(d)[c] = (seen.get(d)[c] || 0) + 1;
+    }
+    for (const [d, counts] of seen) {
+      const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      const data = { [MM.acc]: accountOf(tp).name, [MM.desc]: d };
+      if (ranked.length) data[MM.cat] = ranked[0][0];
+      if (ranked.length > 1) { data[MM.prev] = ranked.map(([c, n]) => `${c} ×${n}`).join(" · "); mixed++; }
+      const row = have.get(`${tp.table}|${d}`);
+      if (!row) add.push(data);
+      else if (ranked.length && (row.data[MM.cat] == null || row.data[MM.cat] === "")) fill.push({ row, data: { ...row.data, ...data } });
+    }
+  }
+  if ([...add, ...fill.map((f) => f.data)].some((d) => d[MM.prev] != null) && !ds.columns.some((c) => c.key === MM.prev)) {
+    const columns = [...ds.columns, { key: MM.prev, label: "קטגוריות קודמות", type: "text" }];
+    const { error } = await sb.from("datasets").update({ columns }).eq("id", ds.id);
+    if (error) throw error;
+    ds.columns = columns;
+  }
+  if (add.length) await insertRows(ds.id, add, "site");
+  for (const f of fill) {
+    const { error } = await sb.from("dataset_rows").update({ data: f.data }).eq("id", f.row.id);
+    if (error) throw error;
+  }
+  return { added: add.length, carried: add.filter((d) => d[MM.cat]).length + fill.length, mixed };
+}
+// one-time move: per-row Category in the bank/card tables -> Movement Mapping, then the column is taken off those tables
+// (the old values stay inside the rows' data, just not shown). Runs again only if a table still has the column.
+async function ensureMovementMapping() {
+  const withOld = accountTopics().map((tp) => state.datasets.find((d) => d.name === tp.table)).filter((d) => d?.columns.some(isOldCategoryCol));
+  if (state.datasets.some((d) => d.name === MOVEMENT_TABLE) && !withOld.length) return null;
+  const res = await syncMovementMapping(true);
+  for (const d of withOld) {
+    const columns = d.columns.filter((c) => !isOldCategoryCol(c));
+    const { error } = await sb.from("datasets").update({ columns }).eq("id", d.id);
+    if (error) throw error;
+    d.columns = columns;
+  }
+  await loadDatasets();
+  return res;
+}
 
 // ---------------- Cash Flow: who the money came from / went to ----------------
 // "העברה מאת: דן שפר, מרינה שפ 10-843-003918627 תרומה"            -> "דן שפר"
@@ -138,13 +254,9 @@ function nameFromRow(row, columns) {
 function deriveCashFlow(t) {
   if (!t.columns.length) return 0;
   // a file that already has its own category column (e.g. category / month / type / amount) keeps it as is
+  // (bank / card tables have no category column: their categories live in Movement Mapping)
   const own = t.columns.find((c) => CAT_RE.test(c.label) && !c.manual && c.label !== CATEGORY_COL.label);
   if (own) addPickers(t.columns);
-  else {
-    const cat = t.columns.find((c) => c.label === CATEGORY_COL.label);
-    if (!cat) t.columns.push({ key: nextKey(t.columns), ...CATEGORY_COL });
-    else Object.assign(cat, CATEGORY_COL);
-  }
   let col = t.columns.find((c) => c.label === NAME_LABEL);
   const key = col ? col.key : nextKey(t.columns);
   let n = 0;
@@ -690,8 +802,12 @@ $("upload-go").addEventListener("click", async () => {
     }
     sb.from("usage_logs").insert({ visitor_name: user.email, action: `upload:${upload.file.name}` }).then(() => {});
     $("upload-dlg").close();
-    toast("הקובץ נטען בהצלחה");
     await loadDatasets();
+    let mm = null; // new descriptions from a bank / card file -> Movement Mapping
+    if (jobs.some((el) => topicOf(el.plan.ds)?.kind || (el.plan.mode === "new" && upload.topic?.kind))) {
+      try { mm = await syncMovementMapping(); await loadDatasets(); } catch (e) { console.error(e); }
+    }
+    toast(mm?.added ? `הקובץ נטען בהצלחה. ${mm.added} תיאורי תנועה חדשים נוספו ל-${MOVEMENT_TABLE}, צריך לבחור להם קטגוריה.` : "הקובץ נטען בהצלחה", mm?.added ? 7000 : 3000);
     if (jobs.length === 1 && lastId) await openDataset(lastId); else { state.ds = null; render(); }
   } catch (err) {
     console.error(err);
@@ -741,6 +857,7 @@ async function openDataset(id) {
   state.q = ""; state.sort = null; state.shown = SHOW; state.editing = null; state.mExtra = []; state.mYear = null;
   $("status").textContent = "טוען…";
   try {
+    if (state.ds.name === MOVEMENT_TABLE) { try { await syncMovementMapping(); } catch (e) { console.error(e); } } // descriptions added since
     state.rows = await loadRows(id);
     await ensurePickers(state.ds);
     await loadLookups(state.ds);
@@ -1321,8 +1438,11 @@ async function start() {
     await ensureCategories();
     await ensureAccounts();
     await loadAccounts();
+    let moved = null;
+    try { moved = await ensureMovementMapping(); } catch (e) { console.error(e); toast("המעבר ל-Movement Mapping נכשל, נסו לרענן", 6000); }
     $("status").textContent = "";
     render();
+    if (moved) toast(`נוצרה הטבלה ${MOVEMENT_TABLE}: ${moved.added} תיאורי תנועה, ${moved.carried} עם קטגוריה מהטבלאות${moved.mixed ? `, ב-${moved.mixed} היו כמה קטגוריות שונות (נבחרה הנפוצה, השאר בעמודה "קטגוריות קודמות")` : ""}.`, 12000);
     sb.from("usage_logs").insert({ visitor_name: user.email, action: "page_view" }).then(() => {});
   } catch (err) {
     console.error(err);

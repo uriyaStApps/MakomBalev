@@ -28,9 +28,9 @@ const toYM = (v) => {
 };
 const typeOf = (v) => (/^\s*in|הכנס|inflow/i.test(String(v ?? "")) ? "in" : /^\s*out|הוצא|outflow/i.test(String(v ?? "")) ? "out" : null);
 
-// Categories table -> order + Inflows/Outflows type per category
+// Category Mapping table -> order + Inflows/Outflows type per category
 async function loadCategoryInfo() {
-  const ds = state.datasets.find((d) => d.name === CATEGORY_COL.lookup);
+  const ds = state.datasets.find((d) => d.name === CATEGORIES_TABLE);
   const info = new Map();
   if (!ds) return info;
   const nameCol = ds.columns.find((c) => /category|קטגורי|סיווג/i.test(c.label)) || ds.columns[0];
@@ -77,9 +77,11 @@ function openingAt(tl, ym) {
 async function loadFacts(r) {
   const ds = state.datasets.find((d) => d.name === r.table);
   if (!ds) return { error: `הטבלה "${r.table}" עדיין לא נטענה. טענו אותה מלשונית הטבלאות.` };
-  const [rows, cats] = await Promise.all([loadRows(ds.id), loadCategoryInfo()]);
+  const acct = topicOf(ds)?.kind; // bank / card table: the category comes from Movement Mapping by the movement's description
+  const [rows, cats, mmap] = await Promise.all([loadRows(ds.id), loadCategoryInfo(), acct ? loadMovementMap() : null]);
   const cols = ds.columns;
-  const catCol = cols.find((c) => c.label === CATEGORY_COL.label && c.manual) || cols.find((c) => CAT_RE.test(c.label));
+  const moveCol = acct ? movementCol(ds) : null, moveCats = mmap?.get(ds.name) || new Map();
+  const catCol = acct ? null : cols.find((c) => CAT_RE.test(c.label));
   const monthCol = cols.find((c) => /^\s*month\s*$|חודש/i.test(c.label));
   const amountCol = cols.find((c) => /amount|סכום/i.test(c.label));
   const typeCol = cols.find((c) => /^\s*type\s*$|סוג/i.test(c.label));
@@ -93,7 +95,7 @@ async function loadFacts(r) {
   const add = (ym, cat, type, amt, name) => { if (ym && amt) facts.push({ ym, cat, type, amt, name }); };
   for (const row of rows) {
     const d = row.data;
-    const cat = catName(catCol && d[catCol.key]);
+    const cat = catName(acct ? moveCol && moveCats.get(descKey(d[moveCol.key])) : catCol && d[catCol.key]);
     const name = nameCol ? d[nameCol.key] ?? NONAME : null;
     const ym = toYM(monthCol ? d[monthCol.key] : dateCol && d[dateCol.key]);
     if (debit || credit) { // bank style: separate debit / credit columns
@@ -108,7 +110,7 @@ async function loadFacts(r) {
   }
   const tl = dateCol && balCol ? balanceTimeline(ds, rows, dateCol, balCol, debit, credit) : null;
   const swapped = balCol ? findSwappedDates(ds, rows).length : 0; // dates stored with day/month swapped (old XLS reads)
-  return { facts, cats, tl, hasNames: !!nameCol, rows: rows.length, swapped, ds };
+  return { facts, cats, tl, hasNames: !!nameCol, rows: rows.length, swapped, ds, mapped: !!acct };
 }
 
 // facts for one year -> matrix
@@ -211,7 +213,7 @@ async function renderReports() {
     ${f.swapped ? `<div class="blocked">⚠ בטבלה ${esc(f.ds.name)} יש <b>${f.swapped}</b> שורות שהתאריך שלהן נשמר הפוך (יום וחודש התחלפו, מטעינה ישנה), ולכן היתרות לפי חודש לא נכונות.
       <button class="btn primary" id="rep-fix-dates">🛠 תיקון התאריכים</button></div>` : ""}
     ${M.mismatch.length ? `<p class="warn">⚠ בחודשים ${M.mismatch.map((x) => `${MONTHS[x.i]} (הפרש ${money(x.diff)})`).join(", ")} התנועות בטבלה לא מסתכמות ליתרה של הבנק. ייתכן שיש שורות כפולות או חסרות (למשל קובץ שנטען פעמיים עם "הוספה בלבד"). היתרות בדוח לקוחות מהבנק עצמו.</p>` : ""}
-    ${uncats ? `<p class="warn">⚠ ${money(uncats)} ₪ בשנה הזאת בלי Category (שורת Uncategorized). אפשר לסווג אותן בטבלה ${esc(r.table)}.</p>` : ""}
+    ${uncats ? `<p class="warn">⚠ ${money(uncats)} ₪ בשנה הזאת בלי Category (שורת Uncategorized). אפשר לסווג אותן בטבלה ${esc(f.mapped ? MOVEMENT_TABLE : r.table)}${f.mapped ? " (קטגוריה לכל תאור תנועה)" : ""}.</p>` : ""}
     <div class="report-grid" dir="ltr">
       <div class="table-wrap"><table class="data report"><thead><tr><th class="lbl">Category</th>${MONTHS.map((m) => `<th>${m}</th>`).join("")}<th>Total</th></tr></thead><tbody>
         ${balRow("Opening bank balance", M.open)}
