@@ -850,12 +850,63 @@ function renderTables() {
 // could be swapped: if its swapped form fits between the nearest certain dates (day > 12) and the stored form doesn't, swap it.
 const swapDM = (v) => { const m = typeof v === "string" && v.match(/^(\d{4})-(\d\d)-(\d\d)(.*)$/); return m && +m[3] <= 12 && m[2] !== m[3] ? `${m[1]}-${m[3]}-${m[2]}${m[4]}` : null; };
 const tOf = (v) => new Date(String(v).slice(0, 10)).getTime();
+
+// Bank posting order, oldest first, rebuilt from the balance column itself: each transaction's balance before it
+// (balance - credit + debit) is the previous transaction's balance. Row ids can't be trusted for this: every upload
+// (replace period / append) adds its rows with new, higher ids, so after a second upload id order is mixed.
+// Rows without a balance (or a table without one) fall back to the old id order heuristic.
+function postingOrder(ds, rows) {
+  const cols = ds.columns, date = cols.find((c) => c.type === "date");
+  const bal = cols.find((c) => /יתרה|balance/i.test(c.label) && c.type === "number");
+  const debit = cols.find((c) => /חובה|debit/i.test(c.label)), credit = cols.find((c) => /זכות|credit/i.test(c.label));
+  const byId = (list) => {
+    const p = [...list].sort((a, b) => a.id - b.id);
+    if (date && p.length && String(p[0].data[date.key] ?? "") > String(p[p.length - 1].data[date.key] ?? "")) p.reverse();
+    return p;
+  };
+  if (!bal || !date) return byId(rows);
+  const cents = (n) => Math.round(n * 100);
+  const pts = [], loose = [];
+  for (const r of rows) {
+    const close = r.data[bal.key];
+    if (typeof close !== "number") { loose.push(r); continue; }
+    const open = close - (Number(credit && r.data[credit.key]) || 0) + (Number(debit && r.data[debit.key]) || 0);
+    pts.push({ r, o: cents(open), c: cents(close), t: String(r.data[date.key] ?? "").slice(0, 10) });
+  }
+  const byOpen = new Map(), closes = new Set(pts.map((p) => p.c));
+  for (const p of pts) { if (!byOpen.has(p.o)) byOpen.set(p.o, []); byOpen.get(p.o).push(p); }
+  const used = new Set(), chains = [];
+  const near = (t) => (a, b) => Math.abs(tOf(a.t) - tOf(t)) - Math.abs(tOf(b.t) - tOf(t)) || a.r.id - b.r.id;
+  const early = (a, b) => a.t.localeCompare(b.t) || a.r.id - b.r.id;
+  while (used.size < pts.length) {
+    const left = pts.filter((p) => !used.has(p));
+    // start where nothing leads in (else the earliest row); follow the balances, nearest date first when ambiguous
+    let cur = left.filter((p) => !closes.has(p.o)).sort(early)[0] || left.sort(early)[0];
+    const chain = [];
+    while (cur) {
+      used.add(cur); chain.push(cur);
+      cur = (byOpen.get(cur.c) || []).filter((p) => !used.has(p)).sort(near(cur.t))[0];
+    }
+    chains.push(chain);
+  }
+  chains.sort((a, b) => early(a[0], b[0]));
+  const order = chains.flat().map((p) => p.r);
+  if (!loose.length) return order;
+  // rows without a balance: slot them in by date
+  const out = [...order];
+  for (const r of byId(loose)) {
+    const t = String(r.data[date.key] ?? "");
+    const i = out.findIndex((x) => String(x.data[date.key] ?? "") > t);
+    out.splice(i < 0 ? out.length : i, 0, r);
+  }
+  return out;
+}
+
 function findSwappedDates(ds, rows) {
   const dateCols = ds.columns.filter((c) => c.type === "date");
   const main = dateCols[0];
   if (!main || rows.length < 3) return [];
-  const pts = [...rows].filter((r) => r.data[main.key]).sort((a, b) => a.id - b.id);
-  if (String(pts[0].data[main.key]) > String(pts[pts.length - 1].data[main.key])) pts.reverse(); // oldest first
+  const pts = postingOrder(ds, rows.filter((r) => r.data[main.key])); // oldest first
   const sure = (r) => !swapDM(r.data[main.key]);
   const WEEK = 7 * 864e5, fixes = [];
   for (let i = 0; i < pts.length; i++) {

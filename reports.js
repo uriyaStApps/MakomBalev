@@ -43,13 +43,12 @@ async function loadCategoryInfo() {
 }
 
 // bank balance before/after each transaction, in time order (Leumi lists the newest first)
-function balanceTimeline(rows, dateCol, balCol, debit, credit) {
-  const pts = rows.filter((r) => typeof r.data[balCol.key] === "number" && r.data[dateCol.key]);
-  if (!pts.length) return null;
-  // by date; rows of the same day keep the bank's posting order (Leumi lists the newest first).
+function balanceTimeline(ds, rows, dateCol, balCol, debit, credit) {
+  // by date; rows of the same day keep the bank's posting order, rebuilt from the balances (postingOrder in app.js,
+  // never from row ids: a second upload mixes them up and the month would close on the wrong same-day balance).
   // Sorting by date means one misdated row can only affect its own month, never every month after it.
-  pts.sort((a, b) => a.id - b.id);
-  if (String(pts[0].data[dateCol.key]) > String(pts[pts.length - 1].data[dateCol.key])) pts.reverse();
+  const pts = postingOrder(ds, rows.filter((r) => typeof r.data[balCol.key] === "number" && r.data[dateCol.key]));
+  if (!pts.length) return null;
   const pos = new Map(pts.map((r, i) => [r, i]));
   pts.sort((a, b) => String(a.data[dateCol.key]).slice(0, 10).localeCompare(String(b.data[dateCol.key]).slice(0, 10)) || pos.get(a) - pos.get(b));
   return pts.map((r) => {
@@ -107,7 +106,7 @@ async function loadFacts(r) {
       add(ym, cat, type, amt, name);
     }
   }
-  const tl = dateCol && balCol ? balanceTimeline(rows, dateCol, balCol, debit, credit) : null;
+  const tl = dateCol && balCol ? balanceTimeline(ds, rows, dateCol, balCol, debit, credit) : null;
   const swapped = balCol ? findSwappedDates(ds, rows).length : 0; // dates stored with day/month swapped (old XLS reads)
   return { facts, cats, tl, hasNames: !!nameCol, rows: rows.length, swapped, ds };
 }
