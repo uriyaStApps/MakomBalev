@@ -132,3 +132,14 @@ table.report td.ytot { font-weight: 700; border-left: 2px solid var(--line); }
 @media (prefers-color-scheme: dark) { .rep-tip { background: #2f2d1f; color: #e8e8ea; border-color: #5c5735; } .rep-tip .tip-day { color: #9a9ea6; } }
 .avg-page { display: inline-flex; align-items: baseline; gap: 6px; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); cursor: help; }
 .avg-page b { font-size: 18px; color: var(--accent); }
+.avg-page { user-select: none; }
+.avg-dlg { max-width: min(560px, calc(100vw - 32px)); }
+.avg-dlg h3 { margin: 0 0 4px; }
+.avg-dlg .formula { margin: 0 0 10px; }
+.avg-calc { width: 100%; margin-bottom: 10px; }
+table.data.avg-calc td { padding: 6px 10px; text-align: left; max-width: none; }
+table.data.avg-calc td.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.avg-calc tr.key td { background: var(--soft); }
+.avg-calc tr.sub td, .avg-calc tr.total td { border-top: 2px solid var(--ink); font-weight: 600; }
+.avg-dlg details { margin: 6px 0; }
+.avg-dlg summary { cursor: pointer; color: var(--accent); margin-bottom: 6px; }

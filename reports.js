@@ -194,17 +194,59 @@ function buildMatrix(f, year, opening0, tl) {
 // "Avg page" (Uriya, 2026-11-17): how many months the current bank balance covers
 // = the bank's latest balance / ((the shown year's Total Outflow - its Partisipans Paymant inflow) / 12)
 const PARTICIPANTS = ["partisipans paymant", "participants payment", "partisipants payment"];
-function avgPage(r, f, M) {
-  if (!r.avgPage || !f.tl?.length) return "";
+// The box shows the result and the month the money lasts until; double-click opens the calculation (avgPageDrill).
+function avgPageCalc(f, M) {
+  if (!f.tl?.length) return null;
   const last = f.tl[f.tl.length - 1], out = M.yearOf(M.tout);
   const pc = M.ins.find((c) => PARTICIPANTS.includes(norm(c.cat)));
   const part = pc ? M.yearOf(pc.m) : 0, monthly = (out - part) / 12;
-  if (!monthly) return "";
+  if (!monthly) return null;
   const v = last.close / monthly;
-  const fmt0 = (n) => Math.round(n).toLocaleString("en-US");
-  const why = `${fmt0(last.close)} (bank balance ${last.day.split("-").reverse().join("/")}) / ((${fmt0(out)} Total Outflow - ${fmt0(part)} ${pc ? pc.cat : "Partisipans Paymant: none this year"}) ${rep.year} / 12 = ${fmt0(monthly)})`;
-  return `<span class="avg-page" dir="ltr" title="${esc(why)}">Avg page <b>${v.toFixed(2)}</b> <span class="muted">= ${fmt0(last.close)} / ${fmt0(monthly)}</span></span>`;
+  // the balance's date + v average months (30.44 days each)
+  const until = new Date(new Date(`${last.day}T12:00:00`).getTime() + v * 30.44 * 864e5);
+  return { last, out, pc, part, monthly, v, until: v > 0 ? `${MONTHS[until.getMonth()]} ${until.getFullYear()}` : null };
 }
+function avgPage(r, f, M) {
+  const a = r.avgPage && avgPageCalc(f, M);
+  if (!a) return "";
+  return `<span class="avg-page" dir="ltr" id="avg-page" title="Double-click: how it's calculated">Avg page <b>${a.v.toFixed(2)}</b>${a.until ? ` <span class="muted">until ${a.until}</span>` : ""}</span>`;
+}
+function avgPageDrill() {
+  const { f, M } = rep.last, a = avgPageCalc(f, M);
+  if (!a) return;
+  const n2 = (n) => n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const day = a.last.day.split("-").reverse().join("/");
+  const acct = accountOf(TOPICS.find((t) => t.table === f.ds.name)).name;
+  const outs = [...M.outs].map((c) => [c.cat, M.yearOf(c.m)]).filter(([, v]) => v).sort((x, y) => y[1] - x[1]);
+  const row = (label, v, cls = "") => `<tr class="${cls}"><td>${label}</td><td class="num">${v}</td></tr>`;
+  let dlg = $("avg-dlg");
+  if (!dlg) {
+    dlg = document.createElement("dialog"); dlg.id = "avg-dlg"; dlg.className = "dlg avg-dlg"; document.body.appendChild(dlg);
+    dlg.addEventListener("click", (e) => { if (e.target === dlg || e.target.closest(".avg-close")) dlg.close(); });
+  }
+  dlg.innerHTML = `<div dir="ltr">
+    <h3>Avg page ${rep.year}: ${a.v.toFixed(2)}${a.until ? ` <span class="muted">(until ${a.until})</span>` : ""}</h3>
+    <p class="muted formula">Current bank balance / ((Total Outflow − Partisipans Paymant) / 12)</p>
+    <table class="data avg-calc"><tbody>
+      ${row(`<b>Numerator</b>: current bank balance <span class="muted">(<bdi>${esc(acct)}</bdi>, ${day})</span>`, n2(a.last.close), "key")}
+      ${row(`Total Outflow ${rep.year}`, n2(a.out))}
+      ${row(`− ${a.pc ? esc(a.pc.cat) : "Partisipans Paymant"} ${rep.year} <span class="muted">(inflow)</span>`, a.pc ? `−${n2(a.part)}` : "0.00 <span class=\"muted\">(none this year)</span>")}
+      ${row(`= Net outflow`, n2(a.out - a.part), "sub")}
+      ${row(`<b>Denominator</b>: ÷ 12 = average month`, n2(a.monthly), "key")}
+      ${row(`<b>Avg page</b> = ${n2(a.last.close)} / ${n2(a.monthly)}`, `<b>${a.v.toFixed(2)}</b>`, "total")}
+      ${a.until ? row(`${day} + ${a.v.toFixed(2)} months`, a.until) : ""}
+    </tbody></table>
+    <details><summary>Total Outflow ${rep.year} by category (${outs.length})</summary>
+      <table class="data avg-calc"><tbody>${outs.map(([c, v]) => row(esc(c), n2(v))).join("")}${row("Total Outflow", n2(a.out), "total")}</tbody></table>
+    </details>
+    ${a.pc ? `<details><summary>${esc(a.pc.cat)} ${rep.year} by month</summary>
+      <table class="data avg-calc"><tbody>${a.pc.m.map((v, i) => (v ? row(MONTHS[i], n2(v)) : "")).join("")}${row("Total", n2(a.part), "total")}</tbody></table>
+    </details>` : ""}
+    <div class="dlg-actions"><button type="button" class="btn avg-close">Close</button></div>
+  </div>`;
+  dlg.showModal();
+}
+$("view-reports").addEventListener("dblclick", (e) => { if (e.target.closest("#avg-page")) { window.getSelection()?.removeAllRanges(); avgPageDrill(); } });
 function openingFor(r, f, year) {
   try { const v = localStorage.getItem(`mb_open_${r.id}_${year}`); if (v !== null && v !== "") return { value: Number(v), manual: true }; } catch {}
   const tl = f.tl || rep.cache.cashflow?.tl; // the outflow sheet has no balance: take it from the bank (Cash Flow table)
