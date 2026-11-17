@@ -98,9 +98,27 @@ const numberLabel = (kind, n) => (kind === "card" ? `כרטיס המסתיים �
 async function ensureCategories() {
   // renamed "Categories" -> "Category Mapping": rename the table in place and point every dropdown at the new name
   const old = state.datasets.find((d) => d.name === OLD_CATEGORIES_TABLE);
-  if (old && !state.datasets.some((d) => d.name === CATEGORIES_TABLE)) {
+  const cur = state.datasets.find((d) => d.name === CATEGORIES_TABLE);
+  if (old && !cur) {
     const { error } = await sb.from("datasets").update({ name: CATEGORIES_TABLE }).eq("id", old.id);
     if (error) console.error(error); else old.name = CATEGORIES_TABLE;
+  } else if (old && cur) {
+    // both exist: a browser still running the old code (cached page) re-created "Categories" with the default list.
+    // Keep Category Mapping: add any category it lacks (with its type), then delete the duplicate.
+    try {
+      const [oldRows, curRows] = await Promise.all([loadRows(old.id), loadRows(cur.id)]);
+      const col = (ds, re) => ds.columns.find((c) => re.test(c.label)) || null;
+      const oc = col(old, /category|קטגורי|סיווג/i) || old.columns[0], ot = col(old, /^\s*type\s*$|סוג/i);
+      const cc = col(cur, /category|קטגורי|סיווג/i) || cur.columns[0], ct = col(cur, /^\s*type\s*$|סוג/i);
+      const have = new Set(curRows.map((r) => descKey(r.data[cc.key]).toLowerCase()));
+      const add = oldRows.filter((r) => descKey(r.data[oc.key]) && !have.has(descKey(r.data[oc.key]).toLowerCase()))
+        .map((r) => ({ [cc.key]: descKey(r.data[oc.key]), ...(ct && ot && r.data[ot.key] != null ? { [ct.key]: r.data[ot.key] } : {}) }));
+      if (add.length) await insertRows(cur.id, add, "site");
+      const { error } = await sb.from("datasets").delete().eq("id", old.id);
+      if (error) throw error;
+      state.datasets = state.datasets.filter((d) => d !== old);
+      if (add.length) toast(`${add.length} קטגוריות מהטבלה הכפולה Categories נוספו ל-${CATEGORIES_TABLE}`, 6000);
+    } catch (e) { console.error(e); }
   }
   for (const d of state.datasets) {
     if (!d.columns.some((c) => c.lookup === OLD_CATEGORIES_TABLE)) continue;
